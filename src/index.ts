@@ -39,12 +39,11 @@ const KRAKEN_PAIRS: Record<string, string> = {
 };
 
 /**
- * Wallet-side ticker → NonKYC market symbol.
- * NonKYC quotes WOW only against USDT, which we treat as ≈ USD for spot pricing.
+ * Tickers we look up on Nonlogs and cexswap.cc.
+ * Wownero is the obvious one (delisted from major CEXes); add others here if
+ * they're not on Kraken either.
  */
-const NONKYC_MARKETS: Record<string, string> = {
-  WOW: "WOW_USDT",
-};
+const NICHE_TICKERS = ["WOW"] as const;
 
 interface RatesPayload {
   rates: Record<string, number>;
@@ -72,43 +71,108 @@ async function fetchKraken(): Promise<Record<string, number>> {
   return out;
 }
 
-async function fetchNonkyc(): Promise<Record<string, number>> {
+/**
+ * Pull all markets from Nonlogs in one call. Returns per-ticker USD price
+ * by averaging the (TICKER-BTC × BTC/USD) and (TICKER-USDT) routes when both
+ * exist. Algorithm taken from ~/src/smirk-backend/src/infra/prices.rs.
+ */
+async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
-  for (const [ticker, market] of Object.entries(NONKYC_MARKETS)) {
-    try {
-      const res = await fetch(`https://api.nonkyc.io/api/v2/ticker/${market}`, {
-        cf: { cacheTtl: 30, cacheEverything: true },
-      });
-      if (!res.ok) continue;
-      // NonKYC ticker shape: { "last_price": "0.0234", ... }. Field name has been
-      // both `last_price` and `last` historically — accept either.
-      const body = (await res.json()) as { last_price?: string; last?: string };
-      const last = body.last_price ?? body.last;
-      if (last) out[ticker] = parseFloat(last);
-    } catch {
-      // Skip — WOW just won't be in this refresh cycle. Stale KV value will be
-      // returned to clients until the next successful refresh.
+  if (btcUsd <= 0) return out;
+
+  const res = await fetch("https://api.nonlogs.io/api/markets", {
+    headers: { "user-agent": "hash-wallet-prices/0.1" },
+    cf: { cacheTtl: 30, cacheEverything: true },
+  });
+  if (!res.ok) throw new Error(`nonlogs http ${res.status}`);
+  const body = (await res.json()) as { markets?: Record<string, { last_price?: string }> };
+  const markets = body.markets ?? {};
+
+  for (const ticker of NICHE_TICKERS) {
+    const sources: number[] = [];
+    const btcPair = markets[`${ticker}-BTC`]?.last_price;
+    if (btcPair) {
+      const p = parseFloat(btcPair);
+      if (p > 0) sources.push(p * btcUsd);
+    }
+    const usdtPair = markets[`${ticker}-USDT`]?.last_price;
+    if (usdtPair) {
+      const p = parseFloat(usdtPair);
+      if (p > 0) sources.push(p);
+    }
+    if (sources.length) {
+      out[ticker] = sources.reduce((a, b) => a + b, 0) / sources.length;
     }
   }
   return out;
 }
 
+/**
+ * Pull all spot markets from cexswap.cc. Endpoint already returns `last_usd`
+ * per pair so no BTC conversion is needed. We average across all spot pairs
+ * for the same base ticker (e.g. WOW/USDT, WOW/BTC, WOW/XMR all converted to
+ * USD by cexswap upstream) for robustness.
+ */
+async function fetchCexswap(): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  const res = await fetch("https://cexswap.cc/api/public/markets/summary", {
+    headers: { accept: "application/json" },
+    cf: { cacheTtl: 30, cacheEverything: true },
+  });
+  if (!res.ok) throw new Error(`cexswap http ${res.status}`);
+  const body = (await res.json()) as
+    | { items?: Array<{ base?: string; last_usd?: number | string }> }
+    | Array<{ base?: string; last_usd?: number | string }>;
+  const items = Array.isArray(body) ? body : (body.items ?? []);
+
+  const buckets: Record<string, number[]> = {};
+  for (const m of items) {
+    const base = (m.base ?? "").toUpperCase();
+    if (!NICHE_TICKERS.includes(base as (typeof NICHE_TICKERS)[number])) continue;
+    const usd = typeof m.last_usd === "string" ? parseFloat(m.last_usd) : m.last_usd;
+    if (usd && usd > 0) {
+      (buckets[base] ??= []).push(usd);
+    }
+  }
+  for (const [ticker, prices] of Object.entries(buckets)) {
+    out[ticker] = prices.reduce((a, b) => a + b, 0) / prices.length;
+  }
+  return out;
+}
+
 async function refreshPrices(env: Env): Promise<RatesPayload> {
-  const [kraken, nonkyc] = await Promise.all([
-    fetchKraken().catch((e) => {
-      console.error("kraken failed", e);
-      return {};
+  // Kraken first — its BTC/USD is needed by the Nonlogs WOW conversion.
+  const kraken = await fetchKraken().catch((e) => {
+    console.error("kraken failed", e);
+    return {} as Record<string, number>;
+  });
+
+  const btcUsd = kraken.BTC ?? 0;
+
+  const [nonlogs, cexswap] = await Promise.all([
+    fetchNonlogs(btcUsd).catch((e) => {
+      console.error("nonlogs failed", e);
+      return {} as Record<string, number>;
     }),
-    fetchNonkyc().catch((e) => {
-      console.error("nonkyc failed", e);
-      return {};
+    fetchCexswap().catch((e) => {
+      console.error("cexswap failed", e);
+      return {} as Record<string, number>;
     }),
   ]);
 
-  const rates: Record<string, number> = { ...kraken, ...nonkyc };
+  const rates: Record<string, number> = { ...kraken };
   const sources: Record<string, string> = {};
   for (const k of Object.keys(kraken)) sources[k] = "kraken";
-  for (const k of Object.keys(nonkyc)) sources[k] = "nonkyc";
+
+  // For niche coins, average across whichever sources returned a price.
+  for (const ticker of NICHE_TICKERS) {
+    const samples: Array<[string, number]> = [];
+    if (nonlogs[ticker]) samples.push(["nonlogs", nonlogs[ticker]]);
+    if (cexswap[ticker]) samples.push(["cexswap", cexswap[ticker]]);
+    if (samples.length === 0) continue;
+    rates[ticker] = samples.reduce((a, [, p]) => a + p, 0) / samples.length;
+    sources[ticker] = samples.map(([s]) => s).join("+");
+  }
 
   // Stables — we don't quote them upstream, just pin to 1.0.
   for (const stable of ["USDT", "USDC", "DAI"]) {

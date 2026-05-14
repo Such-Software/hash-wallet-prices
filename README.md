@@ -6,9 +6,12 @@ Why this exists: see the architectural notes in the wallet repo. Short version �
 
 ## Sources
 
-* **Kraken** — BTC, XMR, LTC, DOGE, ETH, BCH, XNO (all → USD)
-* **NonKYC** — WOW (WOW_USDT, treated as ≈ USD)
-* **Pinned** — USDT, USDC, DAI all return 1.00 (stables we don't quote upstream)
+* **Kraken** (`api.kraken.com/0/public/Ticker`) — BTC, XMR, LTC, DOGE, ETH, BCH, XNO (all → USD).
+* **Nonlogs.io** (`api.nonlogs.io/api/markets`) — WOW. Algorithm averages `WOW-BTC × Kraken BTC/USD` and `WOW-USDT` when both exist. Lifted from `~/src/smirk-backend/src/infra/prices.rs`.
+* **cexswap.cc** (`cexswap.cc/api/public/markets/summary`) — WOW backup. Endpoint returns `last_usd` precomputed per pair, so we average across all WOW spot pairs.
+* **Pinned** — USDT, USDC, DAI all return 1.00.
+
+WOW USD price is the **average of whichever Nonlogs and cexswap routes returned a value** — survives one source going down without a code change.
 
 ## Endpoints
 
