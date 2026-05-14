@@ -15,8 +15,9 @@ id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
 [triggers]
 crons = ["* * * * *"]
 
-# Optional: route this worker behind a custom domain like prices.suchsoftware.com.
-# Uncomment + edit after pointing DNS at Cloudflare and creating the route.
-# [[routes]]
-# pattern = "prices.suchsoftware.com/*"
-# custom_domain = true
+# Custom domain. Will be auto-bound to neroswap.com's DNS zone via the
+# Cloudflare Workers UI when you "Add Custom Domain" — you do NOT create a
+# CNAME manually for this.
+[[routes]]
+pattern = "prices.neroswap.com"
+custom_domain = true
