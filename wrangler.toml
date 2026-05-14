@@ -1,0 +1,22 @@
+name = "hash-wallet-prices"
+main = "src/index.ts"
+compatibility_date = "2026-05-14"
+workers_dev = true
+
+# KV namespace for cached prices.
+# Run `wrangler kv:namespace create PRICES` once, then paste the returned id below.
+# (The script also works without KV — it falls back to fetching upstream on each request.)
+[[kv_namespaces]]
+binding = "PRICES"
+id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
+
+# Run the refresh every 60 seconds.
+# Cloudflare cron triggers fire once per minute at minimum.
+[triggers]
+crons = ["* * * * *"]
+
+# Optional: route this worker behind a custom domain like prices.suchsoftware.com.
+# Uncomment + edit after pointing DNS at Cloudflare and creating the route.
+# [[routes]]
+# pattern = "prices.suchsoftware.com/*"
+# custom_domain = true
