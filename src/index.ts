@@ -23,6 +23,13 @@ export interface Env {
 const KV_KEY = "rates:v1";
 const KV_TTL_SECONDS = 600; // soft expiry; cron writes fresh values every 60s
 
+// Sparkline history — one append per UTC hour, capped to a week per coin.
+const HISTORY_MAX_POINTS = 168;
+
+// Trade status cache lifetime. Trocador deletes trade data after 14 days
+// (per their API docs), so anything longer is wasted KV.
+const TRADE_TTL_SECONDS = 60 * 60 * 24 * 14;
+
 /**
  * Map of wallet-side ticker → Kraken pair name (USD quote).
  * Kraken uses some legacy "X"/"Z" prefixes for older assets; the public Ticker
@@ -187,7 +194,29 @@ async function refreshPrices(env: Env): Promise<RatesPayload> {
   };
 
   await env.PRICES.put(KV_KEY, JSON.stringify(payload), { expirationTtl: KV_TTL_SECONDS });
+  await appendHistory(env, rates);
   return payload;
+}
+
+/**
+ * Append the latest price to per-coin history KV — but only once per UTC hour.
+ * The cron fires every minute; we coalesce so each coin gets ~24 entries/day,
+ * staying well under KV value-size limits and giving a clean sparkline.
+ */
+async function appendHistory(env: Env, rates: Record<string, number>): Promise<void> {
+  const now = Date.now();
+  const currentHour = Math.floor(now / 3_600_000);
+  for (const [coin, price] of Object.entries(rates)) {
+    if (!Number.isFinite(price) || price <= 0) continue;
+    const key = `history:hourly:${coin}`;
+    const existing = ((await env.PRICES.get(key, "json")) ?? []) as Array<[number, number]>;
+    const lastEntry = existing[existing.length - 1];
+    const lastHour = lastEntry ? Math.floor(lastEntry[0] / 3_600_000) : -1;
+    if (lastHour >= currentHour) continue;
+    existing.push([now, price]);
+    while (existing.length > HISTORY_MAX_POINTS) existing.shift();
+    await env.PRICES.put(key, JSON.stringify(existing));
+  }
 }
 
 async function loadRates(env: Env): Promise<RatesPayload> {
@@ -233,6 +262,51 @@ export default {
       const payload = await loadRates(env);
       const price = payload.rates[base] ?? 0;
       return jsonResponse({ results: { [`${base}_${quote}`]: price } });
+    }
+
+    // Sparkline / history. ?coin=BTC&hours=24 returns hourly points for the
+    // last N hours (capped at HISTORY_MAX_POINTS = 168 = 7 days).
+    if (url.pathname === "/v1/sparkline") {
+      const coin = (url.searchParams.get("coin") ?? "").toUpperCase();
+      const hours = Math.min(
+        Math.max(parseInt(url.searchParams.get("hours") ?? "24", 10) || 24, 1),
+        HISTORY_MAX_POINTS,
+      );
+      if (!coin) return jsonResponse({ error: "missing coin" }, 400);
+      const all = ((await env.PRICES.get(`history:hourly:${coin}`, "json")) ?? []) as Array<
+        [number, number]
+      >;
+      const cutoff = Date.now() - hours * 3_600_000;
+      const points = all.filter(([t]) => t >= cutoff);
+      return jsonResponse({ coin, hours, points });
+    }
+
+    // Trocador webhook receiver. They POST the full trade body on every status
+    // change; we stash it under trade:<id> for the wallet to read.
+    if (url.pathname === "/v1/trocador-webhook" && req.method === "POST") {
+      let body: Record<string, unknown>;
+      try {
+        body = (await req.json()) as Record<string, unknown>;
+      } catch {
+        return jsonResponse({ error: "bad json" }, 400);
+      }
+      const tradeId = (body.trade_id ?? body.id) as string | undefined;
+      if (!tradeId) return jsonResponse({ error: "missing trade_id" }, 400);
+      const stored = { ...body, received_at: new Date().toISOString() };
+      await env.PRICES.put(`trade:${tradeId}`, JSON.stringify(stored), {
+        expirationTtl: TRADE_TTL_SECONDS,
+      });
+      return jsonResponse({ ok: true, trade_id: tradeId });
+    }
+
+    // Read cached trade status. Wallet polls this instead of Trocador directly,
+    // letting us aggregate webhook updates across multiple devices and reduce
+    // load on Trocador per their request.
+    const tradeMatch = url.pathname.match(/^\/v1\/trade\/(.+)$/);
+    if (tradeMatch && req.method === "GET") {
+      const cached = await env.PRICES.get(`trade:${tradeMatch[1]}`, "json");
+      if (cached) return jsonResponse(cached);
+      return jsonResponse({ error: "not found" }, 404);
     }
 
     if (url.pathname === "/" || url.pathname === "/healthz") {

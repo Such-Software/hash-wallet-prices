@@ -19,6 +19,9 @@ WOW USD price is the **average of whichever Nonlogs and cexswap routes returned 
 | --- | --- |
 | `GET /v2/rates?base=BTC&quote=USD` | `{ "results": { "BTC_USD": 67342.5 } }` — drop-in compatible with the wallet's existing fetch code |
 | `GET /v1/prices` | `{ "rates": { ... }, "sources": { ... }, "fetched_at": "..." }` — preferred, returns everything in one call |
+| `GET /v1/sparkline?coin=BTC&hours=24` | `{ coin, hours, points: [[ts_ms, price], ...] }` — hourly buckets, max 168 points (7 days) |
+| `POST /v1/trocador-webhook` | Trocador POSTs the full trade body on every status change; we store it under `trade:<id>` for 14 days |
+| `GET /v1/trade/:trade_id` | Returns the cached trade body (whatever Trocador last sent for that id), or 404 |
 | `GET /healthz` | `{ ok: true, coins: N, fetched_at: ... }` |
 
 USD-only for now. Other `quote` values return 0 and the wallet falls back to "price unavailable."

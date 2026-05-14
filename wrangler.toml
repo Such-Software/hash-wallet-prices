@@ -8,7 +8,7 @@ workers_dev = true
 # (The script also works without KV — it falls back to fetching upstream on each request.)
 [[kv_namespaces]]
 binding = "PRICES"
-id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
+id = "ccd6f69c03f14d9b8317eeaed2bf9f23"
 
 # Run the refresh every 60 seconds.
 # Cloudflare cron triggers fire once per minute at minimum.
