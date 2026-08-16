@@ -56,6 +56,37 @@ interface RatesPayload {
   rates: Record<string, number>;
   sources: Record<string, string>;
   fetched_at: string;
+  /** USD -> fiat multipliers from the ECB daily reference rates, so
+   *  COIN_EUR = COIN_USD * fiat.EUR. Absent on payloads cached before the
+   *  forex feature shipped; /v2/rates then falls back to USD-only. */
+  fiat?: Record<string, number>;
+}
+
+/**
+ * ECB daily reference rates (keyless XML, EUR-based). Converted to USD-based
+ * multipliers: usd_to_X = (X per EUR) / (USD per EUR); EUR itself is
+ * 1 / (USD per EUR). Updated by the ECB each business day around 16:00 CET —
+ * more than fresh enough for wallet display prices.
+ */
+async function fetchEcbFiat(): Promise<Record<string, number>> {
+  const res = await fetch(
+    "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
+    { cf: { cacheTtl: 3600, cacheEverything: true } },
+  );
+  if (!res.ok) throw new Error(`ecb http ${res.status}`);
+  const xml = await res.text();
+  const perEur: Record<string, number> = {};
+  for (const m of xml.matchAll(/currency='([A-Z]{3})'\s+rate='([\d.]+)'/g)) {
+    const rate = parseFloat(m[2]);
+    if (rate > 0) perEur[m[1]] = rate;
+  }
+  const usdPerEur = perEur["USD"];
+  if (!usdPerEur) throw new Error("ecb: no USD rate in feed");
+  const out: Record<string, number> = { USD: 1, EUR: 1 / usdPerEur };
+  for (const [cur, rate] of Object.entries(perEur)) {
+    if (cur !== "USD") out[cur] = rate / usdPerEur;
+  }
+  return out;
 }
 
 async function fetchKraken(): Promise<Record<string, number>> {
@@ -193,10 +224,22 @@ async function refreshPrices(env: Env): Promise<RatesPayload> {
     sources[stable] = "pinned";
   }
 
+  // Fiat multipliers for non-USD display. A feed failure degrades to
+  // USD-only (the pre-forex behavior), never to a stale-wrong number: the
+  // wallet shows "price unavailable" for missing quotes.
+  let fiat: Record<string, number> | undefined;
+  try {
+    fiat = await fetchEcbFiat();
+    sources["_fiat"] = "ecb";
+  } catch (e) {
+    console.error("ecb fiat failed", e);
+  }
+
   const payload: RatesPayload = {
     rates,
     sources,
     fetched_at: new Date().toISOString(),
+    ...(fiat ? { fiat } : {}),
   };
 
   await env.PRICES.put(KV_KEY, JSON.stringify(payload), { expirationTtl: KV_TTL_SECONDS });
@@ -261,12 +304,18 @@ export default {
       const base = (url.searchParams.get("base") ?? "").toUpperCase();
       const quote = (url.searchParams.get("quote") ?? "").toUpperCase();
       if (!base) return jsonResponse({ results: {} }, 400);
-      // USD-only for now. Other quotes silently return 0 — wallet treats as
-      // "price unavailable" and shows a placeholder.
-      if (quote !== "USD") return jsonResponse({ results: { [`${base}_${quote}`]: 0 } });
 
       const payload = await loadRates(env);
-      const price = payload.rates[base] ?? 0;
+      const usdPrice = payload.rates[base] ?? 0;
+      // Non-USD quotes convert through the ECB fiat table. Unknown quote
+      // currency, or a payload without fiat data, returns 0 — the wallet
+      // treats that as "price unavailable" and shows a placeholder.
+      let price = 0;
+      if (quote === "USD") {
+        price = usdPrice;
+      } else if (payload.fiat && payload.fiat[quote]) {
+        price = usdPrice * payload.fiat[quote];
+      }
       return jsonResponse({ results: { [`${base}_${quote}`]: price } });
     }
 

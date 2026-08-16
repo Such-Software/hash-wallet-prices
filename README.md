@@ -24,7 +24,7 @@ WOW USD price is the **average of whichever Nonlogs and cexswap routes returned 
 | `GET /v1/trade/:trade_id` | Returns the cached trade body (whatever Trocador last sent for that id), or 404 |
 | `GET /healthz` | `{ ok: true, coins: N, fetched_at: ... }` |
 
-USD-only for now. Other `quote` values return 0 and the wallet falls back to "price unavailable."
+Non-USD quotes convert through ECB daily reference rates (fetched each cron run); an unknown quote currency returns 0 and the wallet falls back to "price unavailable."
 
 ## Deploy
 
