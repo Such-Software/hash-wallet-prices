@@ -116,9 +116,11 @@ async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
 
 /**
  * Pull all spot markets from cexswap.cc. Endpoint already returns `last_usd`
- * per pair so no BTC conversion is needed. We average across all spot pairs
- * for the same base ticker (e.g. WOW/USDT, WOW/BTC, WOW/XMR all converted to
- * USD by cexswap upstream) for robustness.
+ * per pair so no BTC conversion is needed. Prices are volume-weighted across
+ * the base ticker's pairs by 7-day USD volume, and pairs with no 7-day volume
+ * are ignored entirely — a stale `last` print on a dead pair (WOW-ETH's
+ * ancient $0.000087, for example) must never drag the average. If every pair
+ * is dead the ticker is simply omitted and the Nonlogs sample stands alone.
  */
 async function fetchCexswap(): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
@@ -127,22 +129,26 @@ async function fetchCexswap(): Promise<Record<string, number>> {
     cf: { cacheTtl: 30, cacheEverything: true },
   });
   if (!res.ok) throw new Error(`cexswap http ${res.status}`);
-  const body = (await res.json()) as
-    | { items?: Array<{ base?: string; last_usd?: number | string }> }
-    | Array<{ base?: string; last_usd?: number | string }>;
+  type CexswapRow = { base?: string; last_usd?: number | string; volume7d_usd?: number | string };
+  const body = (await res.json()) as { items?: CexswapRow[] } | CexswapRow[];
   const items = Array.isArray(body) ? body : (body.items ?? []);
 
-  const buckets: Record<string, number[]> = {};
+  const num = (v: number | string | undefined): number =>
+    typeof v === "string" ? parseFloat(v) : (v ?? 0);
+
+  const buckets: Record<string, Array<{ usd: number; weight: number }>> = {};
   for (const m of items) {
     const base = (m.base ?? "").toUpperCase();
     if (!NICHE_TICKERS.includes(base as (typeof NICHE_TICKERS)[number])) continue;
-    const usd = typeof m.last_usd === "string" ? parseFloat(m.last_usd) : m.last_usd;
-    if (usd && usd > 0) {
-      (buckets[base] ??= []).push(usd);
+    const usd = num(m.last_usd);
+    const weight = num(m.volume7d_usd);
+    if (usd > 0 && weight > 0) {
+      (buckets[base] ??= []).push({ usd, weight });
     }
   }
-  for (const [ticker, prices] of Object.entries(buckets)) {
-    out[ticker] = prices.reduce((a, b) => a + b, 0) / prices.length;
+  for (const [ticker, samples] of Object.entries(buckets)) {
+    const totalWeight = samples.reduce((a, s) => a + s.weight, 0);
+    out[ticker] = samples.reduce((a, s) => a + s.usd * s.weight, 0) / totalWeight;
   }
   return out;
 }
