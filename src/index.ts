@@ -3,7 +3,9 @@
  *
  * One Cloudflare Worker that:
  *  - Fetches USD spot prices from Kraken for majors (BTC/XMR/LTC/DOGE/ETH/BCH/XNO).
- *  - Fetches WOW from NonKYC (Wownero is too small for major CEX listings).
+ *  - Fetches WOW from Nonlogs + cexswap.cc (too small for major CEX listings).
+ *    Both legs ignore markets with no 24h volume: a stale last print is not a
+ *    price, and this feed is what Hash Bags, Smirk and wowlet display.
  *  - Caches results in KV every 60s via cron, then serves from KV on request.
  *
  * Endpoints:
@@ -110,9 +112,20 @@ async function fetchKraken(): Promise<Record<string, number>> {
 }
 
 /**
- * Pull all markets from Nonlogs in one call. Returns per-ticker USD price
- * by averaging the (TICKER-BTC × BTC/USD) and (TICKER-USDT) routes when both
- * exist. Algorithm taken from ~/src/smirk-backend/src/infra/prices.rs.
+ * Pull all markets from Nonlogs in one call. Returns a per-ticker USD price,
+ * volume-weighting the (TICKER-BTC × BTC/USD) and (TICKER-USDT) routes by
+ * their 24h quote volume.
+ *
+ * Routes with no 24h volume are ignored, for the same reason the cexswap
+ * function ignores them: `last_price` on a market nobody has traded is
+ * whatever the last person paid, whenever that was, and averaging it against
+ * a live route drags the published price. WOW-USDT here is the live example —
+ * a 0.00723 print with null volume against a WOW-BTC route trading at the
+ * equivalent of 0.00816, which pulled the Nonlogs leg about 6% low and, since
+ * the leg is half the WOW blend, every product's displayed price with it.
+ *
+ * If no route on this venue has volume, the ticker is omitted entirely and
+ * the cexswap sample stands alone.
  */
 async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
@@ -123,23 +136,36 @@ async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
     cf: { cacheTtl: 30, cacheEverything: true },
   });
   if (!res.ok) throw new Error(`nonlogs http ${res.status}`);
-  const body = (await res.json()) as { markets?: Record<string, { last_price?: string }> };
+  type NonlogsRow = { last_price?: string | null; quote_volume?: string | null };
+  const body = (await res.json()) as { markets?: Record<string, NonlogsRow> };
   const markets = body.markets ?? {};
 
+  const num = (v: string | null | undefined): number => {
+    const n = parseFloat(v ?? "");
+    return Number.isFinite(n) ? n : 0;
+  };
+
   for (const ticker of NICHE_TICKERS) {
-    const sources: number[] = [];
-    const btcPair = markets[`${ticker}-BTC`]?.last_price;
-    if (btcPair) {
-      const p = parseFloat(btcPair);
-      if (p > 0) sources.push(p * btcUsd);
+    // [usd price, weight in USD] per route.
+    const samples: Array<[number, number]> = [];
+
+    const btcRow = markets[`${ticker}-BTC`];
+    const btcPrice = num(btcRow?.last_price);
+    const btcVol = num(btcRow?.quote_volume);          // volume in BTC
+    if (btcPrice > 0 && btcVol > 0) {
+      samples.push([btcPrice * btcUsd, btcVol * btcUsd]);
     }
-    const usdtPair = markets[`${ticker}-USDT`]?.last_price;
-    if (usdtPair) {
-      const p = parseFloat(usdtPair);
-      if (p > 0) sources.push(p);
+
+    const usdtRow = markets[`${ticker}-USDT`];
+    const usdtPrice = num(usdtRow?.last_price);
+    const usdtVol = num(usdtRow?.quote_volume);        // volume in USDT ≈ USD
+    if (usdtPrice > 0 && usdtVol > 0) {
+      samples.push([usdtPrice, usdtVol]);
     }
-    if (sources.length) {
-      out[ticker] = sources.reduce((a, b) => a + b, 0) / sources.length;
+
+    if (samples.length) {
+      const weight = samples.reduce((a, [, w]) => a + w, 0);
+      out[ticker] = samples.reduce((a, [p, w]) => a + p * w, 0) / weight;
     }
   }
   return out;
