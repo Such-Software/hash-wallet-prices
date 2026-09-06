@@ -91,6 +91,21 @@ async function fetchEcbFiat(): Promise<Record<string, number>> {
   return out;
 }
 
+/**
+ * A book wider than this has no meaningful midpoint, so we use the last trade
+ * instead. 60% is deliberately loose: these are thin markets and a 30% spread
+ * is a normal Tuesday, but the 1000%+ books that appear on dead pairs must
+ * never set a price.
+ */
+const MAX_BOOK_SPREAD_PCT = 60;
+
+/**
+ * A cexswap `last` print older than this is not evidence of the current price.
+ * Its summary carries no book, only the last trade, so staleness is the only
+ * guard available on that source.
+ */
+const MAX_LAST_TRADE_AGE_HOURS = 12;
+
 async function fetchKraken(): Promise<Record<string, number>> {
   const pairs = Object.values(KRAKEN_PAIRS).join(",");
   const url = `https://api.kraken.com/0/public/Ticker?pair=${pairs}`;
@@ -136,7 +151,12 @@ async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
     cf: { cacheTtl: 30, cacheEverything: true },
   });
   if (!res.ok) throw new Error(`nonlogs http ${res.status}`);
-  type NonlogsRow = { last_price?: string | null; quote_volume?: string | null };
+  type NonlogsRow = {
+    last_price?: string | null;
+    quote_volume?: string | null;
+    highest_bid?: string | null;
+    lowest_ask?: string | null;
+  };
   const body = (await res.json()) as { markets?: Record<string, NonlogsRow> };
   const markets = body.markets ?? {};
 
@@ -145,19 +165,45 @@ async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
     return Number.isFinite(n) ? n : 0;
   };
 
+  /**
+   * Prefer the live book midpoint over the last trade.
+   *
+   * A last print says where somebody traded once; on a market doing a few
+   * hundred dollars a day that can be hours old and sitting at the day's low.
+   * The midpoint of the current best bid and ask says where you could trade
+   * now, which is what a price feed is asked for. WOW-BTC on 2026-09-06 is the
+   * case in point: last 10 sat, book 10 bid / 13 ask, mid 11.5.
+   *
+   * Guards, because a midpoint is only meaningful across a real two-sided
+   * book: both sides must exist, the ask must be above the bid, and the spread
+   * must be under MAX_BOOK_SPREAD_PCT. A 1000%-wide book has a midpoint that
+   * means nothing, and on these venues that is common. When any guard fails we
+   * fall back to the last trade rather than dropping the market.
+   */
+  const liveOrLast = (row: NonlogsRow | undefined): number => {
+    const bid = num(row?.highest_bid);
+    const ask = num(row?.lowest_ask);
+    const last = num(row?.last_price);
+    if (bid > 0 && ask > bid) {
+      const mid = (bid + ask) / 2;
+      if (((ask - bid) / mid) * 100 <= MAX_BOOK_SPREAD_PCT) return mid;
+    }
+    return last;
+  };
+
   for (const ticker of NICHE_TICKERS) {
     // [usd price, weight in USD] per route.
     const samples: Array<[number, number]> = [];
 
     const btcRow = markets[`${ticker}-BTC`];
-    const btcPrice = num(btcRow?.last_price);
+    const btcPrice = liveOrLast(btcRow);
     const btcVol = num(btcRow?.quote_volume);          // volume in BTC
     if (btcPrice > 0 && btcVol > 0) {
       samples.push([btcPrice * btcUsd, btcVol * btcUsd]);
     }
 
     const usdtRow = markets[`${ticker}-USDT`];
-    const usdtPrice = num(usdtRow?.last_price);
+    const usdtPrice = liveOrLast(usdtRow);
     const usdtVol = num(usdtRow?.quote_volume);        // volume in USDT ≈ USD
     if (usdtPrice > 0 && usdtVol > 0) {
       samples.push([usdtPrice, usdtVol]);
@@ -186,7 +232,12 @@ async function fetchCexswap(): Promise<Record<string, number>> {
     cf: { cacheTtl: 30, cacheEverything: true },
   });
   if (!res.ok) throw new Error(`cexswap http ${res.status}`);
-  type CexswapRow = { base?: string; last_usd?: number | string; volume7d_usd?: number | string };
+  type CexswapRow = {
+    base?: string;
+    last_usd?: number | string;
+    volume7d_usd?: number | string;
+    last_trade_at_unix?: number | string;
+  };
   const body = (await res.json()) as { items?: CexswapRow[] } | CexswapRow[];
   const items = Array.isArray(body) ? body : (body.items ?? []);
 
@@ -199,7 +250,14 @@ async function fetchCexswap(): Promise<Record<string, number>> {
     if (!NICHE_TICKERS.includes(base as (typeof NICHE_TICKERS)[number])) continue;
     const usd = num(m.last_usd);
     const weight = num(m.volume7d_usd);
-    if (usd > 0 && weight > 0) {
+    // cexswap publishes no book, so the last trade is all we get and staleness
+    // is the only guard we can apply. Seven days of volume can be a single old
+    // fill, and on 2026-09-06 WOW-XMR's last print was the 24h LOW while the
+    // pool itself had moved 13% above it. An old print is not evidence of the
+    // current price, and this source outweighs every other, so it must expire.
+    const tradedAt = num(m.last_trade_at_unix as string | undefined);
+    const ageHours = tradedAt > 0 ? (Date.now() / 1000 - tradedAt) / 3600 : Infinity;
+    if (usd > 0 && weight > 0 && ageHours <= MAX_LAST_TRADE_AGE_HOURS) {
       (buckets[base] ??= []).push({ usd, weight });
     }
   }
@@ -388,6 +446,66 @@ export default {
       const cached = await env.PRICES.get(`trade:${tradeMatch[1]}`, "json");
       if (cached) return jsonResponse(cached);
       return jsonResponse({ error: "not found" }, 404);
+    }
+
+    // The oracle, described by the thing that implements it. A price feed that
+    // cannot say how it arrived at a number is asking to be trusted rather than
+    // checked, and this one gates real quoting decisions.
+    if (url.pathname === "/v1/oracle") {
+      const payload = await loadRates(env);
+      return jsonResponse({
+        schema: "wow-oracle/v1",
+        fetched_at: payload.fetched_at,
+        method:
+          "Majors are Kraken spot. Niche tickers are volume-weighted across " +
+          "Nonlogs and CexSwap. Nonlogs prefers the live book midpoint over " +
+          "the last trade; CexSwap publishes no book, so its last trade is " +
+          "used and expires.",
+        sources: [
+          {
+            venue: "kraken",
+            covers: "majors",
+            price_basis: "spot ticker",
+          },
+          {
+            venue: "nonlogs",
+            covers: "niche tickers, BTC and USDT routes",
+            price_basis:
+              "midpoint of best bid and best ask when both sides exist, the " +
+              "ask is above the bid, and the spread is at or under " +
+              `${MAX_BOOK_SPREAD_PCT}%; otherwise the last trade`,
+            why:
+              "A last print says where somebody traded once. On a market doing " +
+              "a few hundred dollars a day that can be hours old and sitting at " +
+              "the day's low. The midpoint says where you could trade now.",
+          },
+          {
+            venue: "cexswap",
+            covers: "niche tickers, all quote routes",
+            price_basis: "last trade in USD, weighted by 7-day USD volume",
+            expiry_hours: MAX_LAST_TRADE_AGE_HOURS,
+            why:
+              "This summary carries no order book, so staleness is the only " +
+              "guard available. Seven days of volume can be one old fill, and " +
+              "this source can outweigh every other, so an old print expires " +
+              "rather than anchoring the feed.",
+          },
+        ],
+        guards: {
+          max_book_spread_pct: MAX_BOOK_SPREAD_PCT,
+          max_last_trade_age_hours: MAX_LAST_TRADE_AGE_HOURS,
+          zero_volume_pairs: "ignored entirely",
+        },
+        known_limits: [
+          "A venue midpoint is not a depth-weighted price: it says where the " +
+            "touch is, not what size can trade there.",
+          "CexSwap pool prices are not read directly; only its last trade is " +
+            "available without an authenticated quote, so between trades this " +
+            "source lags the pool it describes.",
+          "No source is excluded for being one we ourselves quote on.",
+        ],
+        rates: payload.rates,
+      });
     }
 
     if (url.pathname === "/" || url.pathname === "/healthz") {
