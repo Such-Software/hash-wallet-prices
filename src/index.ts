@@ -48,6 +48,16 @@ const KRAKEN_PAIRS: Record<string, string> = {
 };
 
 /**
+ * Map of wallet-side ticker → Gate.io spot pair. Gate.io carries coins that
+ * never made it onto Kraken but still have a real two-sided book. GRIN is the
+ * current case: Gate lists only GRIN_USDT, so a BTC cross has to be derived
+ * downstream from USD rather than quoted here.
+ */
+const GATEIO_PAIRS: Record<string, string> = {
+  GRIN: "GRIN_USDT",
+};
+
+/**
  * Tickers we look up on Nonlogs and cexswap.cc.
  * Wownero is the obvious one (delisted from major CEXes); add others here if
  * they're not on Kraken either.
@@ -268,6 +278,43 @@ async function fetchCexswap(): Promise<Record<string, number>> {
   return out;
 }
 
+async function fetchGateio(): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  const settled = await Promise.allSettled(
+    Object.entries(GATEIO_PAIRS).map(async ([ticker, pair]) => {
+      const res = await fetch(
+        `https://api.gateio.ws/api/v4/spot/tickers?currency_pair=${pair}`,
+        { headers: { accept: "application/json" }, cf: { cacheTtl: 30, cacheEverything: true } },
+      );
+      if (!res.ok) throw new Error(`gateio http ${res.status} for ${pair}`);
+      const rows = (await res.json()) as Array<{
+        last?: string;
+        highest_bid?: string;
+        lowest_ask?: string;
+      }>;
+      const row = rows?.[0];
+      if (!row) throw new Error(`gateio empty ticker for ${pair}`);
+      const last = parseFloat(row.last ?? "");
+      const bid = parseFloat(row.highest_bid ?? "");
+      const ask = parseFloat(row.lowest_ask ?? "");
+      // Prefer the book mid. `last` is a print, and on a thin market it can sit
+      // outside the current spread; bid and ask are live quotes, which is what
+      // a fair value wants. Fall back to the print only if a side is missing.
+      const mid = bid > 0 && ask > 0 && ask >= bid ? (bid + ask) / 2 : NaN;
+      const px = Number.isFinite(mid) ? mid : last;
+      if (!Number.isFinite(px) || px <= 0) {
+        throw new Error(`gateio no usable price for ${pair}`);
+      }
+      return [ticker, px] as const;
+    }),
+  );
+  for (const r of settled) {
+    if (r.status === "fulfilled") out[r.value[0]] = r.value[1];
+    else console.error("gateio pair failed", r.reason);
+  }
+  return out;
+}
+
 async function refreshPrices(env: Env): Promise<RatesPayload> {
   // Kraken first — its BTC/USD is needed by the Nonlogs WOW conversion.
   const kraken = await fetchKraken().catch((e) => {
@@ -277,7 +324,7 @@ async function refreshPrices(env: Env): Promise<RatesPayload> {
 
   const btcUsd = kraken.BTC ?? 0;
 
-  const [nonlogs, cexswap] = await Promise.all([
+  const [nonlogs, cexswap, gateio] = await Promise.all([
     fetchNonlogs(btcUsd).catch((e) => {
       console.error("nonlogs failed", e);
       return {} as Record<string, number>;
@@ -286,11 +333,26 @@ async function refreshPrices(env: Env): Promise<RatesPayload> {
       console.error("cexswap failed", e);
       return {} as Record<string, number>;
     }),
+    fetchGateio().catch((e) => {
+      console.error("gateio failed", e);
+      return {} as Record<string, number>;
+    }),
   ]);
 
   const rates: Record<string, number> = { ...kraken };
   const sources: Record<string, string> = {};
   for (const k of Object.keys(kraken)) sources[k] = "kraken";
+
+  // Gate.io fills the gap between Kraken and the niche venues. Deliberately
+  // NOT folded into NICHE_TICKERS: that path averages nonlogs and cexswap, the
+  // same venues our own desk quotes into, and an oracle that reads back our
+  // own quotes is exactly the circularity the desk's divergence rail exists to
+  // catch. Kraken still wins wherever it lists the coin.
+  for (const [ticker, px] of Object.entries(gateio)) {
+    if (rates[ticker]) continue;
+    rates[ticker] = px;
+    sources[ticker] = "gateio";
+  }
 
   // For niche coins, average across whichever sources returned a price.
   for (const ticker of NICHE_TICKERS) {
