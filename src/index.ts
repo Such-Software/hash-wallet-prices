@@ -4,8 +4,10 @@
  * One Cloudflare Worker that:
  *  - Fetches USD spot prices from Kraken for majors (BTC/XMR/LTC/DOGE/ETH/BCH/XNO).
  *  - Fetches WOW from Nonlogs + cexswap.cc (too small for major CEX listings).
- *    Both legs ignore markets with no 24h volume: a stale last print is not a
- *    price, and this feed is what Hash Bags, Smirk and wowlet display.
+ *    A last print still needs volume behind it, because a trade nobody has made
+ *    recently is not a price. A live two-sided book inside MAX_BOOK_SPREAD_PCT
+ *    does not: it already says where you could trade now. This feed is what
+ *    Hash Bags, Smirk and wowlet display.
  *  - Caches results in KV every 60s via cron, then serves from KV on request.
  *
  * Endpoints:
@@ -102,12 +104,18 @@ async function fetchEcbFiat(): Promise<Record<string, number>> {
 }
 
 /**
- * A book wider than this has no meaningful midpoint, so we use the last trade
- * instead. 60% is deliberately loose: these are thin markets and a 30% spread
- * is a normal Tuesday, but the 1000%+ books that appear on dead pairs must
- * never set a price.
+ * Widest bid/ask spread whose midpoint still counts as a price.
+ *
+ * Lowered from 60 on 2026-09-17. Sixty was chosen to exclude the absurd, and it
+ * did: a 1000%-wide book has a meaningless midpoint. But it also admitted a book
+ * we are both sides of. That day nonlogs WOW-USDT read 0.0079 bid / 0.0121 ask,
+ * a 42% spread with our own ladder on both sides and nobody in between, and its
+ * $0.01000 midpoint dragged the blended mark to $0.00901 against a truth of
+ * $0.00805. A spread that wide on these venues means no counterparty stands
+ * between our quotes, which is the desk pricing itself. WOW-BTC at 10/11 sat is
+ * 10% wide and prices correctly; 25 keeps that and refuses the reflection.
  */
-const MAX_BOOK_SPREAD_PCT = 60;
+const MAX_BOOK_SPREAD_PCT = 25;
 
 /**
  * A cexswap `last` print older than this is not evidence of the current price.
@@ -115,6 +123,21 @@ const MAX_BOOK_SPREAD_PCT = 60;
  * guard available on that source.
  */
 const MAX_LAST_TRADE_AGE_HOURS = 12;
+
+/**
+ * Weight given to a route priced from a live two-sided book that reports no
+ * volume. It has to be non-zero or the sample divides into nothing and counts
+ * for nothing, and small so a route with real turnover still dominates when one
+ * exists. This is a tie-breaker for a quiet market, not a vote.
+ */
+const BOOK_ONLY_WEIGHT_USD = 25;
+
+/**
+ * 7d USD volume a niche pool must clear before its last trade is evidence of a
+ * price. Matches consensus_min_venue_vol_usd on the desk, which exists because
+ * a $24/day pool once carried 86% of a consensus.
+ */
+const MIN_NICHE_VOL_USD = 25;
 
 async function fetchKraken(): Promise<Record<string, number>> {
   const pairs = Object.values(KRAKEN_PAIRS).join(",");
@@ -201,22 +224,50 @@ async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
     return last;
   };
 
+  /**
+   * A book midpoint and a last trade are not equally trustworthy, so they must
+   * not face the same gate. The midpoint has already proved both sides exist,
+   * that the ask is above the bid, and that the spread is inside
+   * MAX_BOOK_SPREAD_PCT: it says where you could trade right now, and demanding
+   * an odometer reading on top of that discards a live market for having a
+   * quiet day. A last trade has proved none of those things and still needs
+   * volume behind it.
+   *
+   * On 2026-09-17 nonlogs served WOW-BTC at 10 bid / 11 ask with every 24h
+   * counter reading zero. All three WOW routes failed the volume test, nonlogs
+   * dropped out of the sources entirely, and a one-cent cexswap pool was left
+   * alone to price WOW at $0.00041 against a real book at $0.00805.
+   */
+  const priced = (row: NonlogsRow | undefined) => {
+    const bid = num(row?.highest_bid);
+    const ask = num(row?.lowest_ask);
+    const mid = bid > 0 && ask > bid ? (bid + ask) / 2 : 0;
+    const fromBook = mid > 0 && ((ask - bid) / mid) * 100 <= MAX_BOOK_SPREAD_PCT;
+    return { price: liveOrLast(row), fromBook };
+  };
+
   for (const ticker of NICHE_TICKERS) {
     // [usd price, weight in USD] per route.
     const samples: Array<[number, number]> = [];
 
     const btcRow = markets[`${ticker}-BTC`];
-    const btcPrice = liveOrLast(btcRow);
+    const { price: btcPrice, fromBook: btcFromBook } = priced(btcRow);
     const btcVol = num(btcRow?.quote_volume);          // volume in BTC
-    if (btcPrice > 0 && btcVol > 0) {
-      samples.push([btcPrice * btcUsd, btcVol * btcUsd]);
+    if (btcPrice > 0 && (btcVol > 0 || btcFromBook)) {
+      samples.push([
+        btcPrice * btcUsd,
+        Math.max(btcVol * btcUsd, btcFromBook ? BOOK_ONLY_WEIGHT_USD : 0),
+      ]);
     }
 
     const usdtRow = markets[`${ticker}-USDT`];
-    const usdtPrice = liveOrLast(usdtRow);
+    const { price: usdtPrice, fromBook: usdtFromBook } = priced(usdtRow);
     const usdtVol = num(usdtRow?.quote_volume);        // volume in USDT ≈ USD
-    if (usdtPrice > 0 && usdtVol > 0) {
-      samples.push([usdtPrice, usdtVol]);
+    if (usdtPrice > 0 && (usdtVol > 0 || usdtFromBook)) {
+      samples.push([
+        usdtPrice,
+        Math.max(usdtVol, usdtFromBook ? BOOK_ONLY_WEIGHT_USD : 0),
+      ]);
     }
 
     if (samples.length) {
@@ -265,9 +316,17 @@ async function fetchCexswap(): Promise<Record<string, number>> {
     // fill, and on 2026-09-06 WOW-XMR's last print was the 24h LOW while the
     // pool itself had moved 13% above it. An old print is not evidence of the
     // current price, and this source outweighs every other, so it must expire.
+    //
+    // A volume floor as well, because "recent" and "meaningful" are different
+    // questions. On 2026-09-17 WOW-XMR carried $1,064 of 7d volume and was
+    // 18.2h old, so staleness dropped it; WOW-DOGE carried ONE CENT and was
+    // 3.7h old, so it survived alone and priced WOW at $0.00041 while its real
+    // book sat at $0.00805. A pool nobody trades is not a second opinion. Same
+    // reasoning, and the same number, as the desk's consensus_min_venue_vol_usd.
     const tradedAt = num(m.last_trade_at_unix as string | undefined);
     const ageHours = tradedAt > 0 ? (Date.now() / 1000 - tradedAt) / 3600 : Infinity;
-    if (usd > 0 && weight > 0 && ageHours <= MAX_LAST_TRADE_AGE_HOURS) {
+    if (usd > 0 && weight >= MIN_NICHE_VOL_USD
+        && ageHours <= MAX_LAST_TRADE_AGE_HOURS) {
       (buckets[base] ??= []).push({ usd, weight });
     }
   }
