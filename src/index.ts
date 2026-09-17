@@ -113,9 +113,16 @@ async function fetchEcbFiat(): Promise<Record<string, number>> {
  * $0.01000 midpoint dragged the blended mark to $0.00901 against a truth of
  * $0.00805. A spread that wide on these venues means no counterparty stands
  * between our quotes, which is the desk pricing itself. WOW-BTC at 10/11 sat is
- * 10% wide and prices correctly; 25 keeps that and refuses the reflection.
+ * 10% wide and prices correctly; 25 kept that and refused the reflection.
+ *
+ * Raised to 35 hours later, on evidence: WOW-BTC widened to 26.1% inside the
+ * hour and fell back to a stale print at 12.0 sat against a 10.5 sat book, a
+ * 14% error that then tripped the desk's own divergence rail. 25 sat on top of
+ * this market's ordinary breathing. The docblock this replaced said a 30%
+ * spread is a normal Tuesday here, and that was right; 35 clears it while
+ * still refusing the 42% book we are both sides of.
  */
-const MAX_BOOK_SPREAD_PCT = 25;
+const MAX_BOOK_SPREAD_PCT = 35;
 
 /**
  * A cexswap `last` print older than this is not evidence of the current price.
