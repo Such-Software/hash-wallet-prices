@@ -132,6 +132,25 @@ const MAX_BOOK_SPREAD_PCT = 35;
 const MAX_LAST_TRADE_AGE_HOURS = 12;
 
 /**
+ * A route priced from a LAST TRADE, rather than from a live book, has to clear
+ * this much 24h volume to vote. `> 0` was the old rule and it is not a rule at
+ * all: one print qualifies.
+ *
+ * 2026-09-17 is the case for it. We sold 209 WOW by hand at 0.0361, near four
+ * times fair, into a bid that stood above our whole ask ladder. That print
+ * became WOW-USDT's last trade; its book is 42% wide so the midpoint was
+ * refused and the print stood in for it; and the route carried $12 of daily
+ * volume, of which $7.56 was that trade. The mark went to 15.6 sat against a
+ * consensus near 10.7, and the desk's own divergence rail then held every WOW
+ * market it makes. A feed that reports our own trade back to us as the market
+ * is the reflexivity this whole file exists to avoid.
+ *
+ * A live book needs no such floor: it is a standing offer from somebody else,
+ * and it already passed both-sides, ask-above-bid and the spread limit.
+ */
+const MIN_LAST_TRADE_VOL_USD = 25;
+
+/**
  * Weight given to a route priced from a live two-sided book that reports no
  * volume. It has to be non-zero or the sample divides into nothing and counts
  * for nothing, and small so a route with real turnover still dominates when one
@@ -260,7 +279,7 @@ async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
     const btcRow = markets[`${ticker}-BTC`];
     const { price: btcPrice, fromBook: btcFromBook } = priced(btcRow);
     const btcVol = num(btcRow?.quote_volume);          // volume in BTC
-    if (btcPrice > 0 && (btcVol > 0 || btcFromBook)) {
+    if (btcPrice > 0 && (btcVol * btcUsd >= MIN_LAST_TRADE_VOL_USD || btcFromBook)) {
       samples.push([
         btcPrice * btcUsd,
         Math.max(btcVol * btcUsd, btcFromBook ? BOOK_ONLY_WEIGHT_USD : 0),
@@ -270,7 +289,7 @@ async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
     const usdtRow = markets[`${ticker}-USDT`];
     const { price: usdtPrice, fromBook: usdtFromBook } = priced(usdtRow);
     const usdtVol = num(usdtRow?.quote_volume);        // volume in USDT ≈ USD
-    if (usdtPrice > 0 && (usdtVol > 0 || usdtFromBook)) {
+    if (usdtPrice > 0 && (usdtVol >= MIN_LAST_TRADE_VOL_USD || usdtFromBook)) {
       samples.push([
         usdtPrice,
         Math.max(usdtVol, usdtFromBook ? BOOK_ONLY_WEIGHT_USD : 0),
