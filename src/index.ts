@@ -3,11 +3,11 @@
  *
  * One Cloudflare Worker that:
  *  - Fetches USD spot prices from Kraken for majors (BTC/XMR/LTC/DOGE/ETH/BCH/XNO).
- *  - Fetches WOW from Nonlogs + cexswap.cc (too small for major CEX listings).
- *    A last print still needs volume behind it, because a trade nobody has made
- *    recently is not a price. A live two-sided book inside MAX_BOOK_SPREAD_PCT
- *    does not: it already says where you could trade now. This feed is what
- *    Hash Bags, Smirk and wowlet display.
+ *  - Fetches WOW from cexswap.cc and GRIN from Gate.io (too small for major
+ *    CEX listings). A last print needs volume behind it and expires, because a
+ *    trade nobody has made recently is not a price. Nonlogs was a WOW source
+ *    until 2026-10-19; NICHE_TICKERS says why it is not one now. This feed is
+ *    what Hash Bags, Smirk and wowlet display.
  *  - Caches results in KV every 60s via cron, then serves from KV on request.
  *
  * Endpoints:
@@ -60,9 +60,17 @@ const GATEIO_PAIRS: Record<string, string> = {
 };
 
 /**
- * Tickers we look up on Nonlogs and cexswap.cc.
+ * Tickers we look up on cexswap.cc.
  * Wownero is the obvious one (delisted from major CEXes); add others here if
  * they're not on Kraken either.
+ *
+ * Nonlogs was the other half of this blend until 2026-10-19 and is no longer
+ * read. Its BTC, USDT, GRIN and XMR withdrawals had stopped completing for over
+ * a week and its operator had stopped answering, so its books priced balances
+ * that could not leave the venue. WOW, the one coin that still withdrew, traded
+ * there at two to three times its price elsewhere, and as half the blend it
+ * marked WOW at $0.0105 against about $0.0087 on every other venue. Bringing it
+ * back is a decision to make on evidence, not a switch left in the code.
  */
 const NICHE_TICKERS = ["WOW"] as const;
 
@@ -104,59 +112,11 @@ async function fetchEcbFiat(): Promise<Record<string, number>> {
 }
 
 /**
- * Widest bid/ask spread whose midpoint still counts as a price.
- *
- * Lowered from 60 on 2026-09-17. Sixty was chosen to exclude the absurd, and it
- * did: a 1000%-wide book has a meaningless midpoint. But it also admitted a book
- * we are both sides of. That day nonlogs WOW-USDT read 0.0079 bid / 0.0121 ask,
- * a 42% spread with our own ladder on both sides and nobody in between, and its
- * $0.01000 midpoint dragged the blended mark to $0.00901 against a truth of
- * $0.00805. A spread that wide on these venues means no counterparty stands
- * between our quotes, which is the desk pricing itself. WOW-BTC at 10/11 sat is
- * 10% wide and prices correctly; 25 kept that and refused the reflection.
- *
- * Raised to 35 hours later, on evidence: WOW-BTC widened to 26.1% inside the
- * hour and fell back to a stale print at 12.0 sat against a 10.5 sat book, a
- * 14% error that then tripped the desk's own divergence rail. 25 sat on top of
- * this market's ordinary breathing. The docblock this replaced said a 30%
- * spread is a normal Tuesday here, and that was right; 35 clears it while
- * still refusing the 42% book we are both sides of.
- */
-const MAX_BOOK_SPREAD_PCT = 35;
-
-/**
  * A cexswap `last` print older than this is not evidence of the current price.
  * Its summary carries no book, only the last trade, so staleness is the only
  * guard available on that source.
  */
 const MAX_LAST_TRADE_AGE_HOURS = 12;
-
-/**
- * A route priced from a LAST TRADE, rather than from a live book, has to clear
- * this much 24h volume to vote. `> 0` was the old rule and it is not a rule at
- * all: one print qualifies.
- *
- * 2026-09-17 is the case for it. We sold 209 WOW by hand at 0.0361, near four
- * times fair, into a bid that stood above our whole ask ladder. That print
- * became WOW-USDT's last trade; its book is 42% wide so the midpoint was
- * refused and the print stood in for it; and the route carried $12 of daily
- * volume, of which $7.56 was that trade. The mark went to 15.6 sat against a
- * consensus near 10.7, and the desk's own divergence rail then held every WOW
- * market it makes. A feed that reports our own trade back to us as the market
- * is the reflexivity this whole file exists to avoid.
- *
- * A live book needs no such floor: it is a standing offer from somebody else,
- * and it already passed both-sides, ask-above-bid and the spread limit.
- */
-const MIN_LAST_TRADE_VOL_USD = 25;
-
-/**
- * Weight given to a route priced from a live two-sided book that reports no
- * volume. It has to be non-zero or the sample divides into nothing and counts
- * for nothing, and small so a route with real turnover still dominates when one
- * exists. This is a tie-breaker for a quiet market, not a vote.
- */
-const BOOK_ONLY_WEIGHT_USD = 25;
 
 /**
  * 7d USD volume a niche pool must clear before its last trade is evidence of a
@@ -186,131 +146,13 @@ async function fetchKraken(): Promise<Record<string, number>> {
 }
 
 /**
- * Pull all markets from Nonlogs in one call. Returns a per-ticker USD price,
- * volume-weighting the (TICKER-BTC × BTC/USD) and (TICKER-USDT) routes by
- * their 24h quote volume.
- *
- * Routes with no 24h volume are ignored, for the same reason the cexswap
- * function ignores them: `last_price` on a market nobody has traded is
- * whatever the last person paid, whenever that was, and averaging it against
- * a live route drags the published price. WOW-USDT here is the live example —
- * a 0.00723 print with null volume against a WOW-BTC route trading at the
- * equivalent of 0.00816, which pulled the Nonlogs leg about 6% low and, since
- * the leg is half the WOW blend, every product's displayed price with it.
- *
- * If no route on this venue has volume, the ticker is omitted entirely and
- * the cexswap sample stands alone.
- */
-async function fetchNonlogs(btcUsd: number): Promise<Record<string, number>> {
-  const out: Record<string, number> = {};
-  if (btcUsd <= 0) return out;
-
-  const res = await fetch("https://api.nonlogs.io/api/markets", {
-    headers: { "user-agent": "hash-wallet-prices/0.1" },
-    cf: { cacheTtl: 30, cacheEverything: true },
-  });
-  if (!res.ok) throw new Error(`nonlogs http ${res.status}`);
-  type NonlogsRow = {
-    last_price?: string | null;
-    quote_volume?: string | null;
-    highest_bid?: string | null;
-    lowest_ask?: string | null;
-  };
-  const body = (await res.json()) as { markets?: Record<string, NonlogsRow> };
-  const markets = body.markets ?? {};
-
-  const num = (v: string | null | undefined): number => {
-    const n = parseFloat(v ?? "");
-    return Number.isFinite(n) ? n : 0;
-  };
-
-  /**
-   * Prefer the live book midpoint over the last trade.
-   *
-   * A last print says where somebody traded once; on a market doing a few
-   * hundred dollars a day that can be hours old and sitting at the day's low.
-   * The midpoint of the current best bid and ask says where you could trade
-   * now, which is what a price feed is asked for. WOW-BTC on 2026-09-06 is the
-   * case in point: last 10 sat, book 10 bid / 13 ask, mid 11.5.
-   *
-   * Guards, because a midpoint is only meaningful across a real two-sided
-   * book: both sides must exist, the ask must be above the bid, and the spread
-   * must be under MAX_BOOK_SPREAD_PCT. A 1000%-wide book has a midpoint that
-   * means nothing, and on these venues that is common. When any guard fails we
-   * fall back to the last trade rather than dropping the market.
-   */
-  const liveOrLast = (row: NonlogsRow | undefined): number => {
-    const bid = num(row?.highest_bid);
-    const ask = num(row?.lowest_ask);
-    const last = num(row?.last_price);
-    if (bid > 0 && ask > bid) {
-      const mid = (bid + ask) / 2;
-      if (((ask - bid) / mid) * 100 <= MAX_BOOK_SPREAD_PCT) return mid;
-    }
-    return last;
-  };
-
-  /**
-   * A book midpoint and a last trade are not equally trustworthy, so they must
-   * not face the same gate. The midpoint has already proved both sides exist,
-   * that the ask is above the bid, and that the spread is inside
-   * MAX_BOOK_SPREAD_PCT: it says where you could trade right now, and demanding
-   * an odometer reading on top of that discards a live market for having a
-   * quiet day. A last trade has proved none of those things and still needs
-   * volume behind it.
-   *
-   * On 2026-09-17 nonlogs served WOW-BTC at 10 bid / 11 ask with every 24h
-   * counter reading zero. All three WOW routes failed the volume test, nonlogs
-   * dropped out of the sources entirely, and a one-cent cexswap pool was left
-   * alone to price WOW at $0.00041 against a real book at $0.00805.
-   */
-  const priced = (row: NonlogsRow | undefined) => {
-    const bid = num(row?.highest_bid);
-    const ask = num(row?.lowest_ask);
-    const mid = bid > 0 && ask > bid ? (bid + ask) / 2 : 0;
-    const fromBook = mid > 0 && ((ask - bid) / mid) * 100 <= MAX_BOOK_SPREAD_PCT;
-    return { price: liveOrLast(row), fromBook };
-  };
-
-  for (const ticker of NICHE_TICKERS) {
-    // [usd price, weight in USD] per route.
-    const samples: Array<[number, number]> = [];
-
-    const btcRow = markets[`${ticker}-BTC`];
-    const { price: btcPrice, fromBook: btcFromBook } = priced(btcRow);
-    const btcVol = num(btcRow?.quote_volume);          // volume in BTC
-    if (btcPrice > 0 && (btcVol * btcUsd >= MIN_LAST_TRADE_VOL_USD || btcFromBook)) {
-      samples.push([
-        btcPrice * btcUsd,
-        Math.max(btcVol * btcUsd, btcFromBook ? BOOK_ONLY_WEIGHT_USD : 0),
-      ]);
-    }
-
-    const usdtRow = markets[`${ticker}-USDT`];
-    const { price: usdtPrice, fromBook: usdtFromBook } = priced(usdtRow);
-    const usdtVol = num(usdtRow?.quote_volume);        // volume in USDT ≈ USD
-    if (usdtPrice > 0 && (usdtVol >= MIN_LAST_TRADE_VOL_USD || usdtFromBook)) {
-      samples.push([
-        usdtPrice,
-        Math.max(usdtVol, usdtFromBook ? BOOK_ONLY_WEIGHT_USD : 0),
-      ]);
-    }
-
-    if (samples.length) {
-      const weight = samples.reduce((a, [, w]) => a + w, 0);
-      out[ticker] = samples.reduce((a, [p, w]) => a + p * w, 0) / weight;
-    }
-  }
-  return out;
-}
-
-/**
  * Pull all spot markets from cexswap.cc. Endpoint already returns `last_usd`
  * per pair so no BTC conversion is needed. Prices are volume-weighted across
  * the base ticker's pairs by 7-day USD volume, and pairs with no 7-day volume
  * are ignored entirely — a stale `last` print on a dead pair (WOW-ETH's
  * ancient $0.000087, for example) must never drag the average. If every pair
- * is dead the ticker is simply omitted and the Nonlogs sample stands alone.
+ * is dead the ticker is simply omitted, and consumers show the price as
+ * unavailable rather than a wrong one.
  */
 async function fetchCexswap(): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
@@ -341,7 +183,7 @@ async function fetchCexswap(): Promise<Record<string, number>> {
     // is the only guard we can apply. Seven days of volume can be a single old
     // fill, and on 2026-09-06 WOW-XMR's last print was the 24h LOW while the
     // pool itself had moved 13% above it. An old print is not evidence of the
-    // current price, and this source outweighs every other, so it must expire.
+    // current price, and for WOW this is now the only source, so it must expire.
     //
     // A volume floor as well, because "recent" and "meaningful" are different
     // questions. On 2026-09-17 WOW-XMR carried $1,064 of 7d volume and was
@@ -401,17 +243,11 @@ async function fetchGateio(): Promise<Record<string, number>> {
 }
 
 async function refreshPrices(env: Env): Promise<RatesPayload> {
-  // Kraken first — its BTC/USD is needed by the Nonlogs WOW conversion.
-  const kraken = await fetchKraken().catch((e) => {
-    console.error("kraken failed", e);
-    return {} as Record<string, number>;
-  });
-
-  const btcUsd = kraken.BTC ?? 0;
-
-  const [nonlogs, cexswap, gateio] = await Promise.all([
-    fetchNonlogs(btcUsd).catch((e) => {
-      console.error("nonlogs failed", e);
+  // No source depends on another's price any more (Kraken's BTC/USD only ever
+  // converted the Nonlogs WOW-BTC route), so all of them are fetched at once.
+  const [kraken, cexswap, gateio] = await Promise.all([
+    fetchKraken().catch((e) => {
+      console.error("kraken failed", e);
       return {} as Record<string, number>;
     }),
     fetchCexswap().catch((e) => {
@@ -429,24 +265,23 @@ async function refreshPrices(env: Env): Promise<RatesPayload> {
   for (const k of Object.keys(kraken)) sources[k] = "kraken";
 
   // Gate.io fills the gap between Kraken and the niche venues. Deliberately
-  // NOT folded into NICHE_TICKERS: that path averages nonlogs and cexswap, the
-  // same venues our own desk quotes into, and an oracle that reads back our
-  // own quotes is exactly the circularity the desk's divergence rail exists to
-  // catch. Kraken still wins wherever it lists the coin.
+  // NOT folded into NICHE_TICKERS: that path reads cexswap, a venue our own
+  // desk quotes into, and an oracle that reads back our own quotes is exactly
+  // the circularity the desk's divergence rail exists to catch. Kraken still
+  // wins wherever it lists the coin.
   for (const [ticker, px] of Object.entries(gateio)) {
     if (rates[ticker]) continue;
     rates[ticker] = px;
     sources[ticker] = "gateio";
   }
 
-  // For niche coins, average across whichever sources returned a price.
+  // Niche coins come from cexswap alone since Nonlogs was dropped (see
+  // NICHE_TICKERS). With no qualifying pair the ticker is left out, so the
+  // wallet shows the price as unavailable instead of a guess.
   for (const ticker of NICHE_TICKERS) {
-    const samples: Array<[string, number]> = [];
-    if (nonlogs[ticker]) samples.push(["nonlogs", nonlogs[ticker]]);
-    if (cexswap[ticker]) samples.push(["cexswap", cexswap[ticker]]);
-    if (samples.length === 0) continue;
-    rates[ticker] = samples.reduce((a, [, p]) => a + p, 0) / samples.length;
-    sources[ticker] = samples.map(([s]) => s).join("+");
+    if (!cexswap[ticker]) continue;
+    rates[ticker] = cexswap[ticker];
+    sources[ticker] = "cexswap";
   }
 
   // Stables — we don't quote them upstream, just pin to 1.0.
@@ -604,10 +439,11 @@ export default {
         schema: "wow-oracle/v1",
         fetched_at: payload.fetched_at,
         method:
-          "Majors are Kraken spot. Niche tickers are volume-weighted across " +
-          "Nonlogs and CexSwap. Nonlogs prefers the live book midpoint over " +
-          "the last trade; CexSwap publishes no book, so its last trade is " +
-          "used and expires.",
+          "Majors are Kraken spot. Coins Kraken does not list come from the " +
+          "Gate.io book midpoint where Gate lists them. Niche tickers are " +
+          "CexSwap's last trades, weighted by 7-day volume; it publishes no " +
+          "book, so a trade must carry volume and expires. Nonlogs is not " +
+          "read; see excluded.",
         sources: [
           {
             venue: "kraken",
@@ -615,16 +451,11 @@ export default {
             price_basis: "spot ticker",
           },
           {
-            venue: "nonlogs",
-            covers: "niche tickers, BTC and USDT routes",
+            venue: "gateio",
+            covers: "coins Kraken does not list, starting with GRIN",
             price_basis:
-              "midpoint of best bid and best ask when both sides exist, the " +
-              "ask is above the bid, and the spread is at or under " +
-              `${MAX_BOOK_SPREAD_PCT}%; otherwise the last trade`,
-            why:
-              "A last print says where somebody traded once. On a market doing " +
-              "a few hundred dollars a day that can be hours old and sitting at " +
-              "the day's low. The midpoint says where you could trade now.",
+              "midpoint of best bid and best ask; the last trade only when a " +
+              "side is missing",
           },
           {
             venue: "cexswap",
@@ -634,13 +465,24 @@ export default {
             why:
               "This summary carries no order book, so staleness is the only " +
               "guard available. Seven days of volume can be one old fill, and " +
-              "this source can outweigh every other, so an old print expires " +
-              "rather than anchoring the feed.",
+              "this is the only niche source, so an old print expires rather " +
+              "than anchoring the feed.",
+          },
+        ],
+        excluded: [
+          {
+            venue: "nonlogs",
+            since: "2026-10-19",
+            why:
+              "Its BTC, USDT, GRIN and XMR withdrawals had stopped completing " +
+              "and its operator had stopped answering, so its books priced " +
+              "balances that could not leave the venue. WOW, which still " +
+              "withdrew, traded there at two to three times its price elsewhere.",
           },
         ],
         guards: {
-          max_book_spread_pct: MAX_BOOK_SPREAD_PCT,
           max_last_trade_age_hours: MAX_LAST_TRADE_AGE_HOURS,
+          min_niche_7d_volume_usd: MIN_NICHE_VOL_USD,
           zero_volume_pairs: "ignored entirely",
         },
         known_limits: [
@@ -649,6 +491,8 @@ export default {
           "CexSwap pool prices are not read directly; only its last trade is " +
             "available without an authenticated quote, so between trades this " +
             "source lags the pool it describes.",
+          "WOW has one source. When no CexSwap WOW pair has a qualifying trade " +
+            "inside the expiry window, WOW is omitted rather than estimated.",
           "No source is excluded for being one we ourselves quote on.",
         ],
         rates: payload.rates,

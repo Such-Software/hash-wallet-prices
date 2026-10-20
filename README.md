@@ -7,11 +7,13 @@ Why this exists: see the architectural notes in the wallet repo. Short version �
 ## Sources
 
 * **Kraken** (`api.kraken.com/0/public/Ticker`) — BTC, XMR, LTC, DOGE, ETH, BCH, XNO (all → USD).
-* **Nonlogs.io** (`api.nonlogs.io/api/markets`) — WOW. Algorithm averages `WOW-BTC × Kraken BTC/USD` and `WOW-USDT` when both exist. Lifted from `~/src/smirk-backend/src/infra/prices.rs`.
-* **cexswap.cc** (`cexswap.cc/api/public/markets/summary`) — WOW backup. Endpoint returns `last_usd` precomputed per pair, so we average across all WOW spot pairs.
+* **Gate.io** (`api.gateio.ws/api/v4/spot/tickers`) — coins Kraken does not list, currently GRIN, from the book midpoint.
+* **cexswap.cc** (`cexswap.cc/api/public/markets/summary`) — WOW. Endpoint returns `last_usd` precomputed per pair, so we volume-weight across all WOW spot pairs that traded recently with real volume.
 * **Pinned** — USDT, USDC, DAI all return 1.00.
 
-WOW USD price is the **average of whichever Nonlogs and cexswap routes returned a value** — survives one source going down without a code change.
+WOW has one source. When no cexswap WOW pair qualifies, WOW is left out of the payload and the wallet shows the price as unavailable rather than a guess.
+
+**Nonlogs.io is not read** (removed 2026-10-19). Its BTC, USDT, GRIN and XMR withdrawals had stopped completing and its operator had stopped answering, so its books priced balances that could not leave the venue. WOW, which still withdrew, traded there at two to three times its price elsewhere, and as half the WOW blend it marked WOW about 20% high.
 
 ## Endpoints
 
@@ -50,7 +52,7 @@ curl 'localhost:8787/v2/rates?base=BTC&quote=USD'
 ## Adding a coin
 
 1. If Kraken lists it: add `TICKER: "PAIRUSD"` to `KRAKEN_PAIRS` in `src/index.ts`.
-2. If only smaller exchanges list it: add a new fetcher function alongside `fetchNonkyc()` and merge its results in `refreshPrices()`. Keep it `try`/`catch` wrapped so a single source failure doesn't poison the whole refresh.
+2. If only smaller exchanges list it: add a new fetcher function alongside `fetchCexswap()` and merge its results in `refreshPrices()`. Keep it `try`/`catch` wrapped so a single source failure doesn't poison the whole refresh.
 
 ## License
 
@@ -68,13 +70,15 @@ document would.
 | Source | Covers | Price basis |
 | --- | --- | --- |
 | Kraken | majors | spot ticker |
-| Nonlogs | niche tickers, BTC and USDT routes | live book midpoint, falling back to last trade |
+| Gate.io | coins Kraken does not list, starting with GRIN | book midpoint, falling back to last trade when a side is missing |
 | CexSwap | niche tickers, all quote routes | last trade in USD, weighted by 7-day USD volume, expiring after 12 hours |
 
-Niche tickers are volume-weighted across the venues that produce a usable
-number.
+Nonlogs is listed under `excluded` in the oracle response, with the reason.
 
 ### Why the book midpoint, and not the last trade
+
+This section dates from when Nonlogs was a source; Gate.io's midpoint follows
+the same reasoning.
 
 A last print says where somebody traded once. On a market doing a few hundred
 dollars a day that can be many hours old, and it can sit at the day's extreme.
@@ -91,14 +95,11 @@ actually traded.
 
 ### Guards
 
-- **Spread.** A midpoint is only meaningful across a real two-sided book, so
-  both sides must exist, the ask must be above the bid, and the spread must be
-  at or under 60%. Otherwise the last trade is used. 60% is deliberately loose:
-  on these venues a 30% spread is ordinary, while dead pairs show books wider
-  than 1000% that must never set a price.
 - **Staleness.** A CexSwap print older than 12 hours is dropped. Its summary
   carries no book, so staleness is the only guard available there, and seven
   days of volume can be a single old fill.
+- **Volume.** A CexSwap pair needs $25 of seven-day volume before its last
+  trade counts, because a pool nobody trades is not a second opinion.
 - **Dead pairs.** Any pair with no volume is ignored entirely. Without this, a
   stale print on an untraded pair drags the average; WOW-ETH sat at $0.000087
   and WOW-USDT at $0.070 on the same day the coin was worth about $0.009.
