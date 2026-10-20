@@ -7,11 +7,11 @@ Why this exists: see the architectural notes in the wallet repo. Short version �
 ## Sources
 
 * **Kraken** (`api.kraken.com/0/public/Ticker`) — BTC, XMR, LTC, DOGE, ETH, BCH, XNO (all → USD).
-* **Gate.io** (`api.gateio.ws/api/v4/spot/tickers`) — coins Kraken does not list, currently GRIN, from the book midpoint.
-* **cexswap.cc** (`cexswap.cc/api/public/markets/summary`) — WOW. Endpoint returns `last_usd` precomputed per pair, so we volume-weight across all WOW spot pairs that traded recently with real volume.
+* **Gate.io** (`api.gateio.ws/api/v4/spot/tickers`): coins Kraken does not list, currently GRIN, from the book midpoint.
+* **cexswap.cc AMM pools** (`cexswap.cc/api/amm/public/pairs`): WOW. Each pool whose base is WOW is priced at its reserve ratio times the quote asset's USD rate from this feed, and the pools are weighted by the USD value of their quote reserve.
 * **Pinned** — USDT, USDC, DAI all return 1.00.
 
-WOW has one source. When no cexswap WOW pair qualifies, WOW is left out of the payload and the wallet shows the price as unavailable rather than a guess.
+WOW has one venue. When no cexswap WOW pool qualifies, WOW is left out of the payload and the wallet shows the price as unavailable rather than a guess.
 
 **Nonlogs.io is not read** (removed 2026-10-19). Its BTC, USDT, GRIN and XMR withdrawals had stopped completing and its operator had stopped answering, so its books priced balances that could not leave the venue. WOW, which still withdrew, traded there at two to three times its price elsewhere, and as half the WOW blend it marked WOW about 20% high.
 
@@ -71,7 +71,7 @@ document would.
 | --- | --- | --- |
 | Kraken | majors | spot ticker |
 | Gate.io | coins Kraken does not list, starting with GRIN | book midpoint, falling back to last trade when a side is missing |
-| CexSwap | niche tickers, all quote routes | last trade in USD, weighted by 7-day USD volume, expiring after 12 hours |
+| CexSwap | niche tickers, every AMM pool whose base is the ticker | pool price times the quote asset's USD rate, weighted by the USD value of the quote reserve |
 
 Nonlogs is listed under `excluded` in the oracle response, with the reason.
 
@@ -95,22 +95,32 @@ actually traded.
 
 ### Guards
 
-- **Staleness.** A CexSwap print older than 12 hours is dropped. Its summary
-  carries no book, so staleness is the only guard available there, and seven
-  days of volume can be a single old fill.
-- **Volume.** A CexSwap pair needs $25 of seven-day volume before its last
-  trade counts, because a pool nobody trades is not a second opinion.
-- **Dead pairs.** Any pair with no volume is ignored entirely. Without this, a
-  stale print on an untraded pair drags the average; WOW-ETH sat at $0.000087
-  and WOW-USDT at $0.070 on the same day the coin was worth about $0.009.
+- **Depth.** A pool needs $25 of quote-side reserve before it votes. Depth is
+  what it costs to move a pool; on 2026-10-20 this kept WOW-XMR ($1,810),
+  WOW-BTC ($947), WOW-DOGE ($410), WOW-LTC ($140) and WOW-USDT ($64), and
+  dropped WOW-ETH ($24).
+- **Deviation.** A qualifying pool more than 25% from the depth-weighted median
+  is dropped, so one stuck or pushed pool cannot drag the rest. On an ordinary
+  day the WOW pools sit within a few percent of each other.
+- **Direction.** Only pools whose base is the ticker count. In BAN-WOW, WOW is
+  the quote, and the pool prices BAN.
+- **Conversion.** A pool whose quote asset has no USD rate in this feed is
+  skipped rather than guessed.
+
+Pools replaced CexSwap's spot last trades on 2026-10-20. Those were too sparse
+to be the only WOW source: that day every WOW spot print but one had passed its
+12-hour expiry, and the survivor was an 85% spike on WOW-XMR.
 
 ### What it does not do
 
 - A midpoint is not depth-weighted. It says where the touch is, not what size
   can trade there.
-- CexSwap pool prices are not read directly. Only its last trade is available
-  without an authenticated quote, so between trades that source lags the pool
-  it describes.
+- A pool reprices only when someone trades against it, so a quiet pool can lag
+  the wider market. Depth weighting lets the deep pools dominate, and the
+  deviation guard drops one that has drifted far.
+- The owner of this feed is a liquidity provider in the WOW-XMR and WOW-BTC
+  pools. Adding or removing liquidity at the pool ratio does not move the
+  price; only trades do.
 - No source is excluded for being one we quote on ourselves. This is a public
   price index and it prices the market as it finds it; a consumer that needs to
   exclude its own influence has to do that itself.

@@ -3,11 +3,11 @@
  *
  * One Cloudflare Worker that:
  *  - Fetches USD spot prices from Kraken for majors (BTC/XMR/LTC/DOGE/ETH/BCH/XNO).
- *  - Fetches WOW from cexswap.cc and GRIN from Gate.io (too small for major
- *    CEX listings). A last print needs volume behind it and expires, because a
- *    trade nobody has made recently is not a price. Nonlogs was a WOW source
- *    until 2026-10-19; NICHE_TICKERS says why it is not one now. This feed is
- *    what Hash Bags, Smirk and wowlet display.
+ *  - Prices WOW from the cexswap.cc AMM pools and GRIN from Gate.io (too small
+ *    for major CEX listings). A pool always has a price, and moving it costs a
+ *    trade against the whole reserve, so the deep pools carry the weight.
+ *    Nonlogs was a WOW source until 2026-10-19; NICHE_TICKERS says why it is
+ *    not one now. This feed is what Hash Bags, Smirk and wowlet display.
  *  - Caches results in KV every 60s via cron, then serves from KV on request.
  *
  * Endpoints:
@@ -60,7 +60,7 @@ const GATEIO_PAIRS: Record<string, string> = {
 };
 
 /**
- * Tickers we look up on cexswap.cc.
+ * Tickers priced from the cexswap.cc AMM pools whose base they are.
  * Wownero is the obvious one (delisted from major CEXes); add others here if
  * they're not on Kraken either.
  *
@@ -112,18 +112,29 @@ async function fetchEcbFiat(): Promise<Record<string, number>> {
 }
 
 /**
- * A cexswap `last` print older than this is not evidence of the current price.
- * Its summary carries no book, only the last trade, so staleness is the only
- * guard available on that source.
+ * USD value of the quote-side reserve a pool must hold before it votes. Depth
+ * is what it costs to move a pool, so a pool under this is dust that a few
+ * dollars can push anywhere.
+ *
+ * On 2026-10-20 the WOW pools held, on the quote side: WOW-XMR $1,810,
+ * WOW-BTC $947, WOW-DOGE $410, WOW-LTC $140, WOW-USDT $64, WOW-ETH $24. $25
+ * keeps the five with real liquidity and drops WOW-ETH, which no one had traded
+ * that day. It is also the floor used everywhere else in this feed and on the
+ * desk, for the same reason: a pool nobody can trade size against is not a
+ * second opinion.
  */
-const MAX_LAST_TRADE_AGE_HOURS = 12;
+const MIN_POOL_DEPTH_USD = 25;
 
 /**
- * 7d USD volume a niche pool must clear before its last trade is evidence of a
- * price. Matches consensus_min_venue_vol_usd on the desk, which exists because
- * a $24/day pool once carried 86% of a consensus.
+ * A qualifying pool further than this from the depth-weighted median is
+ * dropped before the average. Pools only reprice when someone trades against
+ * them, so a quiet one can sit at a stale ratio, and a shallow one can be
+ * pushed. On 2026-10-20 every WOW pool sat within 6% of the median, so 25%
+ * removes nothing on an ordinary day and stops one stuck or pushed pool from
+ * dragging the rest. Against the median rather than the mean, because the mean
+ * already includes the pool being judged.
  */
-const MIN_NICHE_VOL_USD = 25;
+const MAX_POOL_DEVIATION_PCT = 25;
 
 async function fetchKraken(): Promise<Record<string, number>> {
   const pairs = Object.values(KRAKEN_PAIRS).join(",");
@@ -145,64 +156,95 @@ async function fetchKraken(): Promise<Record<string, number>> {
   return out;
 }
 
+/** One cexswap AMM pool, as much of it as pricing needs. */
+interface Pool {
+  base: string;
+  quote: string;
+  /** Quote per base: the pool's reserve ratio. */
+  price: number;
+  reserveQuote: number;
+}
+
 /**
- * Pull all spot markets from cexswap.cc. Endpoint already returns `last_usd`
- * per pair so no BTC conversion is needed. Prices are volume-weighted across
- * the base ticker's pairs by 7-day USD volume, and pairs with no 7-day volume
- * are ignored entirely — a stale `last` print on a dead pair (WOW-ETH's
- * ancient $0.000087, for example) must never drag the average. If every pair
- * is dead the ticker is simply omitted, and consumers show the price as
- * unavailable rather than a wrong one.
+ * Read the cexswap AMM pools for every niche ticker. Unlike a spot last trade,
+ * a pool always has a current price, its reserve ratio, and that ratio only
+ * moves when somebody trades against the reserve. On 2026-10-20 every WOW spot
+ * print but one had passed its 12-hour expiry, and the survivor, WOW-XMR, was
+ * an 85% spike off a one-cent trade. The pools at the same moment agreed with
+ * each other to within 6%.
+ *
+ * Only pools whose base is the ticker are kept: in BAN-WOW or GRIN-WOW, WOW is
+ * the quote, and that pool prices BAN or GRIN, not WOW.
  */
-async function fetchCexswap(): Promise<Record<string, number>> {
-  const out: Record<string, number> = {};
-  const res = await fetch("https://cexswap.cc/api/public/markets/summary", {
-    headers: { accept: "application/json" },
-    cf: { cacheTtl: 30, cacheEverything: true },
-  });
-  if (!res.ok) throw new Error(`cexswap http ${res.status}`);
-  type CexswapRow = {
-    base?: string;
-    last_usd?: number | string;
-    volume7d_usd?: number | string;
-    last_trade_at_unix?: number | string;
-  };
-  const body = (await res.json()) as { items?: CexswapRow[] } | CexswapRow[];
-  const items = Array.isArray(body) ? body : (body.items ?? []);
-
-  const num = (v: number | string | undefined): number =>
-    typeof v === "string" ? parseFloat(v) : (v ?? 0);
-
-  const buckets: Record<string, Array<{ usd: number; weight: number }>> = {};
-  for (const m of items) {
-    const base = (m.base ?? "").toUpperCase();
-    if (!NICHE_TICKERS.includes(base as (typeof NICHE_TICKERS)[number])) continue;
-    const usd = num(m.last_usd);
-    const weight = num(m.volume7d_usd);
-    // cexswap publishes no book, so the last trade is all we get and staleness
-    // is the only guard we can apply. Seven days of volume can be a single old
-    // fill, and on 2026-09-06 WOW-XMR's last print was the 24h LOW while the
-    // pool itself had moved 13% above it. An old print is not evidence of the
-    // current price, and for WOW this is now the only source, so it must expire.
-    //
-    // A volume floor as well, because "recent" and "meaningful" are different
-    // questions. On 2026-09-17 WOW-XMR carried $1,064 of 7d volume and was
-    // 18.2h old, so staleness dropped it; WOW-DOGE carried ONE CENT and was
-    // 3.7h old, so it survived alone and priced WOW at $0.00041 while its real
-    // book sat at $0.00805. A pool nobody trades is not a second opinion. Same
-    // reasoning, and the same number, as the desk's consensus_min_venue_vol_usd.
-    const tradedAt = num(m.last_trade_at_unix as string | undefined);
-    const ageHours = tradedAt > 0 ? (Date.now() / 1000 - tradedAt) / 3600 : Infinity;
-    if (usd > 0 && weight >= MIN_NICHE_VOL_USD
-        && ageHours <= MAX_LAST_TRADE_AGE_HOURS) {
-      (buckets[base] ??= []).push({ usd, weight });
+async function fetchCexswapPools(): Promise<Pool[]> {
+  const out: Pool[] = [];
+  for (const ticker of NICHE_TICKERS) {
+    const res = await fetch(
+      `https://cexswap.cc/api/amm/public/pairs?search=${ticker}&limit=50`,
+      { headers: { accept: "application/json" }, cf: { cacheTtl: 30, cacheEverything: true } },
+    );
+    if (!res.ok) throw new Error(`cexswap pools http ${res.status}`);
+    type PoolRow = {
+      base?: string;
+      quote?: string;
+      pool_price?: number | string;
+      reserve_quote?: number | string;
+    };
+    const body = (await res.json()) as { items?: PoolRow[] };
+    for (const row of body.items ?? []) {
+      const base = (row.base ?? "").toUpperCase();
+      const quote = (row.quote ?? "").toUpperCase();
+      const price = Number(row.pool_price);
+      const reserveQuote = Number(row.reserve_quote);
+      if (base !== ticker || !quote) continue;
+      if (!(price > 0) || !(reserveQuote > 0)) continue;
+      out.push({ base, quote, price, reserveQuote });
     }
   }
-  for (const [ticker, samples] of Object.entries(buckets)) {
-    const totalWeight = samples.reduce((a, s) => a + s.weight, 0);
-    out[ticker] = samples.reduce((a, s) => a + s.usd * s.weight, 0) / totalWeight;
-  }
   return out;
+}
+
+/**
+ * USD price of `ticker` from its pools: each pool's price times its quote
+ * asset's USD rate from this same feed, weighted by the USD value of the quote
+ * reserve. A pool whose quote has no USD rate here cannot be converted and is
+ * skipped; a pool under MIN_POOL_DEPTH_USD does not vote; a pool more than
+ * MAX_POOL_DEVIATION_PCT from the depth-weighted median is dropped. Returns
+ * undefined when nothing qualifies, so the ticker is omitted rather than
+ * guessed.
+ */
+function priceFromPools(
+  ticker: string,
+  pools: Pool[],
+  usd: Record<string, number>,
+): number | undefined {
+  const votes: Array<{ usd: number; depth: number }> = [];
+  for (const p of pools) {
+    const quoteUsd = usd[p.quote];
+    if (p.base !== ticker || !(quoteUsd > 0)) continue;
+    const depth = p.reserveQuote * quoteUsd;
+    if (depth < MIN_POOL_DEPTH_USD) continue;
+    votes.push({ usd: p.price * quoteUsd, depth });
+  }
+  if (votes.length === 0) return undefined;
+
+  votes.sort((a, b) => a.usd - b.usd);
+  const total = votes.reduce((a, v) => a + v.depth, 0);
+  let seen = 0;
+  let median = votes[votes.length - 1].usd;
+  for (const v of votes) {
+    seen += v.depth;
+    if (seen >= total / 2) {
+      median = v.usd;
+      break;
+    }
+  }
+
+  const kept = votes.filter(
+    (v) => (Math.abs(v.usd - median) / median) * 100 <= MAX_POOL_DEVIATION_PCT,
+  );
+  const weight = kept.reduce((a, v) => a + v.depth, 0);
+  return kept.reduce((a, v) => a + v.usd * v.depth, 0) / weight;
 }
 
 async function fetchGateio(): Promise<Record<string, number>> {
@@ -245,14 +287,15 @@ async function fetchGateio(): Promise<Record<string, number>> {
 async function refreshPrices(env: Env): Promise<RatesPayload> {
   // No source depends on another's price any more (Kraken's BTC/USD only ever
   // converted the Nonlogs WOW-BTC route), so all of them are fetched at once.
-  const [kraken, cexswap, gateio] = await Promise.all([
+  // The pools are converted to USD afterwards, from the rates computed here.
+  const [kraken, pools, gateio] = await Promise.all([
     fetchKraken().catch((e) => {
       console.error("kraken failed", e);
       return {} as Record<string, number>;
     }),
-    fetchCexswap().catch((e) => {
-      console.error("cexswap failed", e);
-      return {} as Record<string, number>;
+    fetchCexswapPools().catch((e) => {
+      console.error("cexswap pools failed", e);
+      return [] as Pool[];
     }),
     fetchGateio().catch((e) => {
       console.error("gateio failed", e);
@@ -266,7 +309,7 @@ async function refreshPrices(env: Env): Promise<RatesPayload> {
 
   // Gate.io fills the gap between Kraken and the niche venues. Deliberately
   // NOT folded into NICHE_TICKERS: that path reads cexswap, a venue our own
-  // desk quotes into, and an oracle that reads back our own quotes is exactly
+  // desk trades on, and an oracle that reads back our own quotes is exactly
   // the circularity the desk's divergence rail exists to catch. Kraken still
   // wins wherever it lists the coin.
   for (const [ticker, px] of Object.entries(gateio)) {
@@ -275,19 +318,21 @@ async function refreshPrices(env: Env): Promise<RatesPayload> {
     sources[ticker] = "gateio";
   }
 
-  // Niche coins come from cexswap alone since Nonlogs was dropped (see
-  // NICHE_TICKERS). With no qualifying pair the ticker is left out, so the
-  // wallet shows the price as unavailable instead of a guess.
-  for (const ticker of NICHE_TICKERS) {
-    if (!cexswap[ticker]) continue;
-    rates[ticker] = cexswap[ticker];
-    sources[ticker] = "cexswap";
-  }
-
-  // Stables — we don't quote them upstream, just pin to 1.0.
+  // Stables: we don't quote them upstream, just pin to 1.0. Pinned before the
+  // pools are priced, because a WOW-USDT pool needs USDT's rate to convert.
   for (const stable of ["USDT", "USDC", "DAI"]) {
     rates[stable] = 1.0;
     sources[stable] = "pinned";
+  }
+
+  // Niche coins come from the cexswap pools alone since Nonlogs was dropped
+  // (see NICHE_TICKERS). With no qualifying pool the ticker is left out, so
+  // the wallet shows the price as unavailable instead of a guess.
+  for (const ticker of NICHE_TICKERS) {
+    const px = priceFromPools(ticker, pools, rates);
+    if (px === undefined) continue;
+    rates[ticker] = px;
+    sources[ticker] = "cexswap-pools";
   }
 
   // Fiat multipliers for non-USD display. A feed failure degrades to
@@ -440,10 +485,11 @@ export default {
         fetched_at: payload.fetched_at,
         method:
           "Majors are Kraken spot. Coins Kraken does not list come from the " +
-          "Gate.io book midpoint where Gate lists them. Niche tickers are " +
-          "CexSwap's last trades, weighted by 7-day volume; it publishes no " +
-          "book, so a trade must carry volume and expires. Nonlogs is not " +
-          "read; see excluded.",
+          "Gate.io book midpoint where Gate lists them. Niche tickers come from " +
+          "the CexSwap AMM pools whose base they are: each pool's price times " +
+          "its quote asset's USD rate from this feed, weighted by the USD value " +
+          "of the quote reserve, after dropping shallow pools and pools far " +
+          "from the depth-weighted median. Nonlogs is not read; see excluded.",
         sources: [
           {
             venue: "kraken",
@@ -459,14 +505,15 @@ export default {
           },
           {
             venue: "cexswap",
-            covers: "niche tickers, all quote routes",
-            price_basis: "last trade in USD, weighted by 7-day USD volume",
-            expiry_hours: MAX_LAST_TRADE_AGE_HOURS,
+            covers: "niche tickers, every AMM pool whose base is the ticker",
+            price_basis:
+              "pool price (reserve ratio) times the quote asset's USD rate, " +
+              "weighted by the USD value of the quote reserve",
             why:
-              "This summary carries no order book, so staleness is the only " +
-              "guard available. Seven days of volume can be one old fill, and " +
-              "this is the only niche source, so an old print expires rather " +
-              "than anchoring the feed.",
+              "A pool always has a current price, and moving it costs a trade " +
+              "against the whole reserve. A spot last trade can be one cent of " +
+              "volume many hours old: on 2026-10-20 every WOW spot print but " +
+              "one had expired, and the survivor was an 85% spike.",
           },
         ],
         excluded: [
@@ -481,18 +528,22 @@ export default {
           },
         ],
         guards: {
-          max_last_trade_age_hours: MAX_LAST_TRADE_AGE_HOURS,
-          min_niche_7d_volume_usd: MIN_NICHE_VOL_USD,
-          zero_volume_pairs: "ignored entirely",
+          min_pool_depth_usd: MIN_POOL_DEPTH_USD,
+          max_pool_deviation_pct: MAX_POOL_DEVIATION_PCT,
+          pools_without_a_usd_quote: "skipped",
+          pools_where_the_ticker_is_the_quote: "ignored",
         },
         known_limits: [
           "A venue midpoint is not a depth-weighted price: it says where the " +
             "touch is, not what size can trade there.",
-          "CexSwap pool prices are not read directly; only its last trade is " +
-            "available without an authenticated quote, so between trades this " +
-            "source lags the pool it describes.",
-          "WOW has one source. When no CexSwap WOW pair has a qualifying trade " +
-            "inside the expiry window, WOW is omitted rather than estimated.",
+          "A pool reprices only when someone trades against it, so a quiet " +
+            "pool can lag the wider market; depth weighting lets the deep pools " +
+            "dominate and the deviation guard drops one that has drifted far.",
+          "The owner of this feed is a liquidity provider in the WOW-XMR and " +
+            "WOW-BTC pools. Adding or removing liquidity at the pool ratio does " +
+            "not move the price; only trades do.",
+          "WOW has one venue. When no CexSwap WOW pool qualifies, WOW is " +
+            "omitted rather than estimated.",
           "No source is excluded for being one we ourselves quote on.",
         ],
         rates: payload.rates,
