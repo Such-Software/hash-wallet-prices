@@ -10,6 +10,18 @@ workers_dev = true
 binding = "PRICES"
 id = "ccd6f69c03f14d9b8317eeaed2bf9f23"
 
+# Market history (neroswap.com/markets, charts). Create once, then uncomment:
+#   npx wrangler d1 create neroswap-prices        # paste the database_id below
+#   npx wrangler d1 migrations apply neroswap-prices --remote
+# Until this binding exists the spot feed works as before and the history
+# endpoints answer 503. Usage stays inside the Workers Paid plan's included D1
+# quota: about 6,000 rows written a day against 50 million a month included.
+# [[d1_databases]]
+# binding = "HISTORY"
+# database_name = "neroswap-prices"
+# database_id = "<paste from wrangler d1 create>"
+# migrations_dir = "migrations"
+
 # Run the refresh every 60 seconds.
 # Cloudflare cron triggers fire once per minute at minimum.
 [triggers]

@@ -6,10 +6,10 @@ Why this exists: see the architectural notes in the wallet repo. Short version �
 
 ## Sources
 
-* **Kraken** (`api.kraken.com/0/public/Ticker`) — BTC, XMR, LTC, DOGE, ETH, BCH, XNO (all → USD).
+* **Kraken** (`api.kraken.com/0/public/Ticker`) — BTC, XMR, LTC, DOGE, ETH, ETC, BCH, XNO, DAI (all → USD).
 * **Gate.io** (`api.gateio.ws/api/v4/spot/tickers`): coins Kraken does not list, currently GRIN, from the book midpoint.
 * **cexswap.cc AMM pools** (`cexswap.cc/api/amm/public/pairs`): WOW. Each pool whose base is WOW is priced at its reserve ratio times the quote asset's USD rate from this feed, and the pools are weighted by the USD value of their quote reserve.
-* **Pinned** — USDT, USDC, DAI all return 1.00.
+* **Pinned** — USDT and USDC return 1.00 (DAI too, only if Kraken has no DAI quote).
 
 WOW has one venue. When no cexswap WOW pool qualifies, WOW is left out of the payload and the wallet shows the price as unavailable rather than a guess.
 
@@ -25,6 +25,9 @@ WOW has one venue. When no cexswap WOW pool qualifies, WOW is left out of the pa
 | `POST /v1/trocador-webhook` | Trocador POSTs the full trade body on every status change; we store it under `trade:<id>` for 14 days |
 | `GET /v1/trade/:trade_id` | Returns the cached trade body (whatever Trocador last sent for that id), or 404 |
 | `GET /healthz` | `{ ok: true, coins: N, fetched_at: ... }` |
+| `GET /v1/markets` | `{ coins: [{ rank, symbol, name, price, change_1h, change_24h, change_7d, circulating_supply, supply_source, supply_at, market_cap, sparkline_7d }], fetched_at }` |
+| `GET /v1/history?coin=BTC&interval=5m\|1h&from=&to=` | `{ coin, interval, columns, points }`; `5m` is `[ts, price]` for up to 90 days, `1h` is `[ts, open, high, low, close]` for all time. Unix seconds. |
+| `GET /v1/history/export?since=&limit=` | every five-minute point and supply reading after `since`, paged with `next_since` until `complete`; neroswap-site keeps its own copy from this |
 
 Non-USD quotes convert through ECB daily reference rates (fetched each cron run); an unknown quote currency returns 0 and the wallet falls back to "price unavailable."
 
@@ -39,6 +42,25 @@ npx wrangler deploy
 ```
 
 After first deploy the worker is live at `https://hash-wallet-prices.<your-cloudflare-subdomain>.workers.dev`. To put it behind `prices.suchsoftware.com`, point that hostname's DNS at Cloudflare and uncomment the `[[routes]]` block in `wrangler.toml`.
+
+## Market history (D1)
+
+The cron records the listed coins (`MARKET_COINS` in `src/markets.ts`) into D1:
+one five-minute point per coin, folded into an hourly candle, plus circulating
+supply once an hour (`src/supply.ts` says where each figure comes from).
+Five-minute points are kept 90 days; candles and supply are kept indefinitely.
+About 6,000 rows are written a day, well inside the Workers Paid plan's included
+D1 quota, so this adds nothing to the bill.
+
+Setup, once:
+
+```bash
+npx wrangler d1 create neroswap-prices      # paste database_id into wrangler.toml, uncomment [[d1_databases]]
+npx wrangler d1 migrations apply neroswap-prices --remote
+npx wrangler deploy
+```
+
+Without the binding the history endpoints answer 503 and nothing else changes.
 
 ## Local dev
 

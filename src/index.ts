@@ -15,13 +15,25 @@
  *      (Drop-in shape compatible with the wallet's existing fiat_conversion_service.dart.)
  *  - GET /v1/prices                    → { "rates": { ... }, "fetched_at": "..." }
  *      (Preferred future shape — single call returns everything.)
+ *  - GET /v1/markets                   → market listing: price, 1h/24h/7d change,
+ *      circulating supply, market cap and a 7-day sparkline per coin (D1).
+ *  - GET /v1/history?coin=BTC&interval=5m|1h&from=&to=  → one coin's series.
+ *  - GET /v1/history/export?since=     → every point after `since`, paged, so
+ *      neroswap-site can keep its own copy.
  *
  * USD only. The wallet's other fiat currencies will see price=0 and degrade
  * gracefully via existing fallback logic.
  */
 
+import { MARKET_SYMBOLS, buildMarkets, prunePoints, readExport, readHistory, readMarketInputs, recordPrices, recordSupply, type Interval } from "./markets.ts";
+import { fetchAllSupply } from "./supply.ts";
+
 export interface Env {
   PRICES: KVNamespace;
+  /** Market history (see migrations/). Optional so the spot feed keeps
+   *  working on a deploy that has no D1 binding yet; the history endpoints
+   *  answer 503 until it exists. */
+  HISTORY?: D1Database;
 }
 
 const KV_KEY = "rates:v1";
@@ -47,6 +59,8 @@ const KRAKEN_PAIRS: Record<string, string> = {
   ETH: "ETHUSD",
   BCH: "BCHUSD",
   XNO: "NANOUSD",
+  ETC: "ETCUSD",
+  DAI: "DAIUSD",
 };
 
 /**
@@ -318,9 +332,11 @@ async function refreshPrices(env: Env): Promise<RatesPayload> {
     sources[ticker] = "gateio";
   }
 
-  // Stables: we don't quote them upstream, just pin to 1.0. Pinned before the
-  // pools are priced, because a WOW-USDT pool needs USDT's rate to convert.
+  // Stables Kraken does not quote are pinned to 1.0; DAI has a real Kraken
+  // market, so it keeps that price. Pinned before the pools are priced,
+  // because a WOW-USDT pool needs USDT's rate to convert.
   for (const stable of ["USDT", "USDC", "DAI"]) {
+    if (rates[stable]) continue;
     rates[stable] = 1.0;
     sources[stable] = "pinned";
   }
@@ -397,6 +413,66 @@ function jsonResponse(body: unknown, status = 200): Response {
       "access-control-allow-origin": "*",
     },
   });
+}
+
+const HISTORY_INTERVALS: Record<Interval, { maxSpanSec: number }> = {
+  "5m": { maxSpanSec: 90 * 86_400 },
+  "1h": { maxSpanSec: 10 * 365 * 86_400 },
+};
+
+/** Edge-cache a history answer for a minute; the data only changes every five. */
+async function cachedJson(req: URL, build: () => Promise<unknown>): Promise<Response> {
+  const cache = typeof caches !== "undefined" ? (caches as unknown as { default: Cache }).default : undefined;
+  const key = new Request(req.toString());
+  const hit = await cache?.match(key);
+  if (hit) return hit;
+  const res = new Response(JSON.stringify(await build()), {
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "public, max-age=60",
+      "access-control-allow-origin": "*",
+    },
+  });
+  await cache?.put(key, res.clone());
+  return res;
+}
+
+async function historyResponse(url: URL, env: Env, db: D1Database): Promise<Response> {
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  if (url.pathname === "/v1/markets") {
+    return cachedJson(url, async () => {
+      const [payload, stored] = await Promise.all([loadRates(env), readMarketInputs(db, nowSec)]);
+      return {
+        coins: buildMarkets({ rates: payload.rates, sources: payload.sources, ...stored }, nowSec),
+        fetched_at: payload.fetched_at,
+      };
+    });
+  }
+
+  if (url.pathname === "/v1/history") {
+    const coin = (url.searchParams.get("coin") ?? "").toUpperCase();
+    const interval = (url.searchParams.get("interval") ?? "1h") as Interval;
+    if (!MARKET_SYMBOLS.includes(coin)) return jsonResponse({ error: "unknown coin" }, 400);
+    if (!(interval in HISTORY_INTERVALS)) return jsonResponse({ error: "interval must be 5m or 1h" }, 400);
+    const to = parseInt(url.searchParams.get("to") ?? "", 10) || nowSec;
+    const defaultFrom = to - (interval === "5m" ? 86_400 : 30 * 86_400);
+    const from = Math.max(parseInt(url.searchParams.get("from") ?? "", 10) || defaultFrom, to - HISTORY_INTERVALS[interval].maxSpanSec);
+    return cachedJson(url, async () => ({
+      coin,
+      interval,
+      columns: interval === "5m" ? ["ts", "price"] : ["ts", "open", "high", "low", "close"],
+      points: await readHistory(db, coin, interval, from, to, 10_000),
+    }));
+  }
+
+  if (url.pathname === "/v1/history/export") {
+    const since = parseInt(url.searchParams.get("since") ?? "0", 10) || 0;
+    const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "5000", 10) || 5000, 100), 10_000);
+    return jsonResponse(await readExport(db, since, limit));
+  }
+
+  return jsonResponse({ error: "not found" }, 404);
 }
 
 export default {
@@ -559,13 +635,50 @@ export default {
       });
     }
 
+    if (url.pathname === "/v1/markets" || url.pathname.startsWith("/v1/history")) {
+      if (!env.HISTORY) return jsonResponse({ error: "market history is not configured" }, 503);
+      return historyResponse(url, env, env.HISTORY);
+    }
+
     return jsonResponse({ error: "not found" }, 404);
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(refreshPrices(env).then(
-      (p) => console.log(`refreshed ${Object.keys(p.rates).length} coins`),
-      (e) => console.error("refresh failed", e),
-    ));
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const nowSec = Math.floor(event.scheduledTime / 1000);
+    const minute = Math.floor(nowSec / 60) % 60;
+    const db = env.HISTORY;
+
+    ctx.waitUntil(
+      refreshPrices(env).then(
+        async (p) => {
+          console.log(`refreshed ${Object.keys(p.rates).length} coins`);
+          // A history failure must never cost the wallet its spot prices, which
+          // are already in KV by the time this runs.
+          if (db && minute % 5 === 0) {
+            await recordPrices(db, p.rates, p.sources, nowSec).then(
+              (n) => console.log(`recorded ${n} market prices`),
+              (e) => console.error("record prices failed", e),
+            );
+          }
+        },
+        (e) => console.error("refresh failed", e),
+      ),
+    );
+
+    // Supply moves slowly, so once an hour, off the five-minute marks.
+    if (db && minute === 7) {
+      ctx.waitUntil(
+        fetchAllSupply(MARKET_SYMBOLS)
+          .then((supply) => recordSupply(db, supply, nowSec))
+          .then(
+            (n) => console.log(`recorded supply for ${n} coins`),
+            (e) => console.error("record supply failed", e),
+          ),
+      );
+    }
+
+    if (db && minute === 17 && Math.floor(nowSec / 3600) % 24 === 0) {
+      ctx.waitUntil(prunePoints(db, nowSec).catch((e) => console.error("prune failed", e)));
+    }
   },
 };
