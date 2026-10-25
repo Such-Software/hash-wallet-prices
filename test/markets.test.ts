@@ -18,7 +18,7 @@ import {
   recordPrices,
   recordSupply,
 } from "../src/markets.ts";
-import { dogeSupply, grinSupply, halvingSupply, uint256ToNumber } from "../src/supply.ts";
+import { dogeSupply, emissionSupply, grinSupply, halvingSupply, uint256ToNumber } from "../src/supply.ts";
 
 class Statement {
   db: DatabaseSync;
@@ -87,6 +87,14 @@ test("grin and erc-20 supply decoding", () => {
   assert.equal(grinSupply(0), 60);
   assert.equal(grinSupply(4_077_817), 244_669_080);
   assert.equal(uint256ToNumber("0x" + (5_000_000n * 10n ** 18n).toString(16).padStart(64, "0"), 18), 5_000_000);
+});
+
+test("emission monitor totals are used as issued, and only once caught up", () => {
+  // xmrchain.net, 2026-10-25: coinbase is already net of fees.
+  const xmr = emissionSupply({ blk_no: 3_791_972, coinbase: "18822359249164307290" }, 3_791_980, 1e12);
+  assert.ok(Math.abs(xmr - 18_822_359.249) < 0.01);
+  assert.throws(() => emissionSupply({ blk_no: 120_000, coinbase: "1000" }, 885_573, 1e11), /still scanning/);
+  assert.throws(() => emissionSupply({}, 885_573, 1e11), /no emission data/);
 });
 
 test("a change needs history that reaches back far enough", () => {

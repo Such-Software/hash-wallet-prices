@@ -9,18 +9,15 @@
  *    block since block 600,000, so both are computed from height (Dogecoin
  *    from an anchor, since its early rewards were random).
  *  - Coins whose supply depends on history (burns, uncles, tail emission)
- *    read a figure published from chain data: Monero's explorer emission
- *    counter, ultrasound.money for ETH, Blockscout for ETC, and DAI's own
+ *    read a figure published from chain data: the onion explorer's emission
+ *    counter for XMR (xmrchain.net) and WOW (explore.wownero.com, ours),
+ *    ultrasound.money for ETH, Blockscout for ETC, and DAI's own
  *    totalSupply().
  *
  * Blockchair is read for BCH's height only. On 2026-10-25 one of its
  * Dogecoin answers was 140,000 blocks ahead of every other explorer and 16B
  * DOGE high, and the next answer was fine, so its supply figures are not used.
  * recordSupply also refuses any figure far from the last one recorded.
- *
- * WOW has no fetcher yet. Its reward schedule is not the plain cryptonote
- * formula, and explore.wownero.com runs with its emission monitor off, so there
- * is no figure to read; the listing shows no market cap rather than a guess.
  *
  * A failed fetch returns nothing and the listing keeps showing the last
  * recorded figure with its timestamp, so an outage ages the number visibly
@@ -91,6 +88,36 @@ async function tipHeight(url: string): Promise<number> {
   return height;
 }
 
+/**
+ * Circulating supply from an onion explorer's emission monitor. Its `coinbase`
+ * total is already net of fees (the monitor subtracts each block's fees before
+ * adding), so it is the amount issued. A monitor that is still scanning from
+ * genesis reports a partial total; that figure is refused until its block is
+ * within EMISSION_MAX_LAG of the explorer's tip, or the 2% guard in
+ * recordSupply would later refuse the real one.
+ */
+export const EMISSION_MAX_LAG = 100;
+export function emissionSupply(
+  emission: { blk_no?: number; coinbase?: string | number },
+  tipHeight: number,
+  atomicPerCoin: number,
+): number {
+  const { blk_no, coinbase } = emission;
+  if (typeof blk_no !== "number" || coinbase === undefined) throw new Error("no emission data");
+  if (!(tipHeight > 0) || tipHeight - blk_no > EMISSION_MAX_LAG) {
+    throw new Error(`emission monitor at block ${blk_no}, tip ${tipHeight}: still scanning`);
+  }
+  return Number(BigInt(coinbase)) / atomicPerCoin;
+}
+
+async function explorerEmission(base: string, atomicPerCoin: number): Promise<number> {
+  const [emission, info] = await Promise.all([
+    getJson<{ status?: string; data?: { blk_no?: number; coinbase?: string | number } }>(`${base}/api/emission`),
+    getJson<{ data?: { height?: number } }>(`${base}/api/networkinfo`),
+  ]);
+  if (emission.status !== "success" || !emission.data) throw new Error(`${new URL(base).host}: emission monitor off`);
+  return emissionSupply(emission.data, info.data?.height ?? 0, atomicPerCoin);
+}
 
 const DAI_CONTRACT = "0x6B175474E89094C44Da98b954EedeAC495271d0F";
 
@@ -122,15 +149,15 @@ export const SUPPLY_FETCHERS: Record<string, Fetcher> = {
     return { circulating: dogeSupply(body.height), source: "computed from block height (blockcypher.com)" };
   },
 
-  XMR: async () => {
-    // The explorer's emission monitor sums every coinbase, which includes the
-    // fees miners collected; those were already circulating, so subtract them.
-    const body = await getJson<{ data?: { coinbase?: string; fee?: string } }>("https://xmrchain.net/api/emission");
-    const coinbase = body.data?.coinbase;
-    const fee = body.data?.fee;
-    if (!coinbase || !fee) throw new Error("xmrchain: no emission data");
-    return { circulating: Number(BigInt(coinbase) - BigInt(fee)) / 1e12, source: "xmrchain.net emission" };
-  },
+  XMR: async () => ({
+    circulating: await explorerEmission("https://xmrchain.net", 1e12),
+    source: "xmrchain.net emission",
+  }),
+
+  WOW: async () => ({
+    circulating: await explorerEmission("https://explore.wownero.com", 1e11),
+    source: "explore.wownero.com emission",
+  }),
 
   ETH: async () => {
     const body = await getJson<{ m5?: { supply: number }[] }>("https://ultrasound.money/api/v2/fees/supply-over-time");
